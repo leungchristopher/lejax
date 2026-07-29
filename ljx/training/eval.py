@@ -14,11 +14,17 @@ from flax.core import freeze, unfreeze
 from flax.traverse_util import path_aware_map
 from flax.training import train_state
 
-from ljx.data.dali_pipeline import build_labeled_iterator
-from ljx.data.tiny_imagenet import build_val_file_list, class_names
+from ljx.data.jax_augment import TINY_IMAGENET_MEAN, TINY_IMAGENET_STD
+from ljx.data.raw_loader import LabeledImageLoader
+from ljx.data.tiny_imagenet import build_train_file_list, build_val_file_list, class_names
+from ljx.models.backbone import ViT
 from ljx.models.lejepa import LeJEPAConfig
 from ljx.models.linear import LinearClassifier, LinearClassifierConfig
 from ljx.training import checkpoint, metrics
+
+
+def _normalize(images: jnp.ndarray) -> jnp.ndarray:
+    return (images - TINY_IMAGENET_MEAN) / TINY_IMAGENET_STD
 
 
 @dataclass(frozen=True)
@@ -44,7 +50,7 @@ def _optimizer(config: EvalConfig) -> optax.GradientTransformation:
             "trainable": optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
             "frozen": optax.set_to_zero(),
         },
-        label_fn=lambda params: path_aware_map(_label_fn, params),
+        param_labels=lambda params: path_aware_map(_label_fn, params),
     )
 
 
@@ -77,7 +83,12 @@ def eval_step(state: ProbeState, images: jnp.ndarray, targets: jnp.ndarray):
 
 
 def load_backbone_params(checkpoint_path: pathlib.Path, model_config: LeJEPAConfig, template_params) -> dict:
-    lejepa_template = {"params": template_params, "batch_stats": {}, "opt_state": (), "sigreg_step": jnp.array(0)}
+    lejepa_template = {
+        "params": template_params,
+        "batch_stats": {},
+        "opt_state": (),
+        "sigreg_step": jnp.array(0),
+    }
     restored = checkpoint.load(checkpoint_path, lejepa_template)
     return restored["params"]["backbone"]
 
@@ -103,34 +114,28 @@ class EvalRun:
     def launch(self) -> None:
         config = self.config
         class_to_index = {name: i for i, name in enumerate(self.classes)}
+        size = config.model.backbone.image_size
+
+        train_file_list = build_train_file_list(self.dataset_root, class_to_index)
         val_file_list = build_val_file_list(self.dataset_root, class_to_index)
 
-        train_iter = build_labeled_iterator(
-            file_root=str(self.dataset_root / "train"),
-            batch_size=config.batch_size,
-            num_threads=config.num_workers,
-            seed=config.seed,
-            shuffle=True,
+        train_loader = LabeledImageLoader(
+            train_file_list, self.dataset_root / "train", config.batch_size,
+            size=size, shuffle=True, seed=config.seed, num_workers=config.num_workers,
         )
-        valid_iter = build_labeled_iterator(
-            file_list=str(val_file_list),
-            file_root=str(self.dataset_root / "val"),
-            batch_size=config.batch_size,
-            num_threads=config.num_workers,
-            seed=config.seed,
-            shuffle=False,
+        valid_loader = LabeledImageLoader(
+            val_file_list, self.dataset_root / "val", config.batch_size,
+            size=size, shuffle=False, seed=config.seed, num_workers=config.num_workers,
         )
 
         rng = jax.random.PRNGKey(config.seed)
         embed_dim = config.model.backbone.embed_dim
         probe_model = LinearClassifierConfig(embed_dim=embed_dim, num_classes=self.num_classes())
 
-        from ljx.models.backbone import ViT
-
         backbone = ViT(config=config.model.backbone)
         classifier = LinearClassifier(backbone=backbone, config=probe_model)
 
-        sample = jnp.zeros((1, config.model.backbone.image_size, config.model.backbone.image_size, 3))
+        sample = jnp.zeros((1, size, size, 3))
         variables = classifier.init(rng, sample)
         pretrained_backbone = load_backbone_params(
             self.checkpoint_path, config.model, variables["params"]["backbone"]
@@ -151,14 +156,14 @@ class EvalRun:
             epoch_start = time.time()
 
             train_losses, train_acc = [], []
-            for batch in train_iter:
-                state, loss, acc = train_step(state, batch["images"], batch["labels"])
+            for images, labels in train_loader:
+                state, loss, acc = train_step(state, _normalize(jnp.asarray(images)), jnp.asarray(labels))
                 train_losses.append(loss)
                 train_acc.append(acc)
 
             valid_losses, valid_acc = [], []
-            for batch in valid_iter:
-                loss, acc = eval_step(state, batch["images"], batch["labels"])
+            for images, labels in valid_loader:
+                loss, acc = eval_step(state, _normalize(jnp.asarray(images)), jnp.asarray(labels))
                 valid_losses.append(loss)
                 valid_acc.append(acc)
 

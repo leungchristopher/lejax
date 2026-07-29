@@ -9,9 +9,18 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
+from ljx.data.jax_augment import generate_views
+from ljx.data.raw_loader import CachedImageLoader
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
-from ljx.training.train_loop import LeJEPATrainState, TrainingConfig, _views_from_batch, train_step
+from ljx.training.train_loop import (
+    GLOBAL_VIEW,
+    LOCAL_VIEW,
+    NUM_GLOBAL_VIEWS,
+    NUM_LOCAL_VIEWS,
+    LeJEPATrainState,
+    TrainingConfig,
+    train_step,
+)
 
 
 def run_one(
@@ -25,23 +34,20 @@ def run_one(
     run_dir = pathlib.Path(artifact_directory) / name
     train_list, _ = split_pretrain_file_lists(dataset_path, config.num_valid_images, run_dir)
 
-    train_iter = build_multicrop_iterator(
-        file_root=str(dataset_path),
-        file_list=str(train_list),
-        batch_size=config.batch_size,
-        num_threads=config.num_workers,
-        seed=config.seed,
-        shuffle=True,
+    train_loader = CachedImageLoader(
+        train_list, dataset_path, config.batch_size,
+        shuffle=True, seed=config.seed, num_workers=config.num_workers,
     )
 
     rng = jax.random.PRNGKey(config.seed)
-    crop_config = MultiCropConfig()
-    dummy_global = jnp.zeros((1, crop_config.global_size, crop_config.global_size, 3))
-    dummy_local = jnp.zeros((1, crop_config.local_size, crop_config.local_size, 3))
+    rng, init_rng = jax.random.split(rng)
+    dummy_images = jnp.zeros((1, 64, 64, 3))
+    dummy_global = list(generate_views(init_rng, dummy_images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
+    dummy_local = list(generate_views(init_rng, dummy_images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
 
     model = config.model.init()
     variables = model.init(
-        rng, [dummy_global], [dummy_local], deterministic=True, use_running_average=True
+        init_rng, dummy_global, dummy_local, deterministic=True, use_running_average=True
     )
     optimizer = optax.adamw(config.learning_rate, weight_decay=config.weight_decay)
     state = LeJEPATrainState.create(
@@ -55,11 +61,12 @@ def run_one(
     losses, predictions, sigregs = [], [], []
     start = time.time()
     steps_run = 0
-    for batch in train_iter:
+    for batch in train_loader:
         if steps_run >= num_steps:
             break
-        global_views, local_views = _views_from_batch(batch)
-        state, loss = train_step(state, global_views, local_views, config.model)
+        rng, step_rng = jax.random.split(rng)
+        images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
+        state, loss = train_step(state, images, step_rng, config.model)
         losses.append(loss.total)
         predictions.append(loss.prediction)
         sigregs.append(loss.sigreg)

@@ -77,8 +77,8 @@ WIDE_PROJECTOR = _config(
 )
 
 # Cheapest projector in the sweep, larger batch — tests whether a lighter
-# head changes T4 throughput meaningfully now that DALI has moved
-# augmentation off the CPU.
+# head changes T4 throughput meaningfully now that augmentation runs on
+# device (jax_augment) instead of the CPU.
 LIGHT_PROJECTOR_FAST = _config(
     lejepa_lambda=0.02,
     num_projections=512,

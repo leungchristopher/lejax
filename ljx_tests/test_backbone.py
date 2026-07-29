@@ -6,7 +6,8 @@ from ljx.models.backbone import ViT, ViTConfig, resample_matrix
 
 
 def tiny_config():
-    return ViTConfig(depth=2, embed_dim=24, num_heads=2)
+    # float32: CPU dot_general doesn't support fp16 (the production default)
+    return ViTConfig(depth=2, embed_dim=24, num_heads=2, compute_dtype="float32")
 
 
 def images(key, batch, size):

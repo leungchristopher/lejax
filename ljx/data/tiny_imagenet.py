@@ -1,9 +1,9 @@
 """
 Tiny ImageNet path/label handling for the labeled (probe) pipeline.
 
-train/ is one directory per class (DALI labels it automatically); val/ is
-flat plus val_annotations.txt, so this builds an explicit file_list for it
-using the same alphabetical class order DALI's file_root reader uses.
+train/ is one directory per class; val/ is flat plus val_annotations.txt.
+Both need an explicit file_list built here, sharing the same alphabetical
+class order as class_names() so train and val label indices line up.
 """
 
 from __future__ import annotations
@@ -17,6 +17,20 @@ def class_names(train_root: pathlib.Path) -> list[str]:
     if not names:
         raise ValueError(f"found no class directories under {train_root}")
     return names
+
+
+def build_train_file_list(dataset_root: pathlib.Path, class_to_index: dict[str, int]) -> pathlib.Path:
+    """train/<wnid>/images/*.jpeg -> explicit file_list, same layout as
+    build_val_file_list, so both feed the same labeled loader."""
+    train_root = pathlib.Path(dataset_root) / "train"
+    lines = []
+    for wnid, index in class_to_index.items():
+        for image_path in sorted((train_root / wnid / "images").glob("*.jpeg")):
+            lines.append(f"{wnid}/images/{image_path.name} {index}")
+
+    file_list = train_root / "file_list.txt"
+    file_list.write_text("\n".join(lines) + "\n")
+    return file_list
 
 
 def build_val_file_list(dataset_root: pathlib.Path, class_to_index: dict[str, int]) -> pathlib.Path:
@@ -54,8 +68,9 @@ def split_pretrain_file_lists(
     dataset_path: pathlib.Path, num_valid_images: int, artifact_directory: pathlib.Path
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Sorted recursive scan, tail split off as validation. Writes two
-    file_list manifests (relative paths, dummy label — DALI's reader
-    requires some label column) under artifact_directory."""
+    file_list manifests (relative paths, dummy label — pretraining doesn't
+    use labels, but raw_loader.py's `<path> <label>` format needs the column)
+    under artifact_directory."""
     dataset_path = pathlib.Path(dataset_path)
     artifact_directory = pathlib.Path(artifact_directory)
 

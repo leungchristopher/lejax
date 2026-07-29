@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -21,6 +22,7 @@ class ViTConfig:
     num_heads: int = 3
     mlp_ratio: float = 4.0
     dropout: float = 0.0
+    compute_dtype: str = "bfloat16"
 
     def __post_init__(self) -> None:
         if self.image_size % self.patch_size != 0:
@@ -47,29 +49,60 @@ class ViTConfig:
 
 
 class _EncoderBlock(nn.Module):
-    """Pre-norm: LN -> MHSA -> residual, LN -> MLP -> residual."""
+    """Pre-norm: LN -> MHSA -> residual, LN -> MLP -> residual.
+
+    Hand-rolled QK^T/softmax/V rather than jax.nn.dot_product_attention:
+    benchmarked slower on T4 (Turing) — its fully-fused cuDNN kernel path
+    targets Ampere+, and T4 falls back to something worse than this."""
 
     embed_dim: int
     num_heads: int
     mlp_dim: int
     dropout: float
+    deterministic: bool
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
-        y = nn.LayerNorm()(x)
-        y = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            dropout_rate=self.dropout,
-        )(y, y, deterministic=deterministic)
+    def __call__(self, carry: jnp.ndarray, _):
+        x = carry
+        batch, seq, _ = x.shape
+        head_dim = self.embed_dim // self.num_heads
+        scale = head_dim ** -0.5
+
+        def _dropout(value):
+            # self.dropout is a static float, not traced — this branch is
+            # resolved at trace time. At rate 0.0 nn.Dropout is a no-op but
+            # still runs RNG split + bernoulli + mask + scale as real ops on
+            # every call (3x per block here), which is pure launch-overhead
+            # waste on hardware where per-kernel latency dominates.
+            if self.dropout == 0.0:
+                return value
+            return nn.Dropout(self.dropout)(value, deterministic=self.deterministic)
+
+        y = nn.LayerNorm(dtype=self.dtype)(x)
+        qkv = nn.Dense(3 * self.embed_dim, dtype=self.dtype, name="qkv")(y)
+        qkv = qkv.reshape(batch, seq, 3, self.num_heads, head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(self.dtype)
+        attn = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
+        attn = jnp.transpose(attn, (0, 2, 1, 3)).reshape(batch, seq, self.embed_dim)
+
+        y = nn.Dense(self.embed_dim, dtype=self.dtype, name="attn_out")(attn)
+        y = _dropout(y)
         x = x + y
 
-        y = nn.LayerNorm()(x)
-        y = nn.Dense(self.mlp_dim)(y)
+        y = nn.LayerNorm(dtype=self.dtype)(x)
+        y = nn.Dense(self.mlp_dim, dtype=self.dtype)(y)
         y = nn.gelu(y)
-        y = nn.Dropout(self.dropout)(y, deterministic=deterministic)
-        y = nn.Dense(self.embed_dim)(y)
-        y = nn.Dropout(self.dropout)(y, deterministic=deterministic)
-        return x + y
+        y = _dropout(y)
+        y = nn.Dense(self.embed_dim, dtype=self.dtype)(y)
+        y = _dropout(y)
+        return x + y, None
 
 
 def resample_matrix(source: int, target: int) -> jnp.ndarray:
@@ -93,6 +126,7 @@ class ViT(nn.Module):
     def __call__(self, images: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """images: [batch, height, width, 3] -> [batch, embed_dim]."""
         cfg = self.config
+        compute_dtype = jnp.dtype(cfg.compute_dtype)
         batch, height, width, channels = images.shape
         if channels != IN_CHANNELS:
             raise ValueError(f"ViT expects {IN_CHANNELS}-channel input, got {channels}")
@@ -109,8 +143,9 @@ class ViT(nn.Module):
             strides=(cfg.patch_size, cfg.patch_size),
             padding="VALID",
             name="patch_embed",
+            dtype=compute_dtype,
         )
-        tokens = patch_embed(images).reshape(batch, grid_h * grid_w, cfg.embed_dim)
+        tokens = patch_embed(images.astype(compute_dtype)).reshape(batch, grid_h * grid_w, cfg.embed_dim)
 
         normal = nn.initializers.normal(stddev=EMBED_INIT_STD)
         cls_token = self.param("cls_token", normal, (1, 1, cfg.embed_dim))
@@ -118,21 +153,29 @@ class ViT(nn.Module):
             "pos_embed", normal, (1, cfg.num_patches + 1, cfg.embed_dim)
         )
 
-        cls = jnp.broadcast_to(cls_token, (batch, 1, cfg.embed_dim))
+        cls = jnp.broadcast_to(cls_token, (batch, 1, cfg.embed_dim)).astype(compute_dtype)
         tokens = jnp.concatenate([cls, tokens], axis=1)
-        tokens = tokens + self._positional_embedding(pos_embed, grid_h, grid_w)
+        pos = self._positional_embedding(pos_embed, grid_h, grid_w).astype(compute_dtype)
+        tokens = tokens + pos
 
         mlp_dim = int(cfg.embed_dim * cfg.mlp_ratio)
-        for _ in range(cfg.depth):
-            tokens = _EncoderBlock(
-                embed_dim=cfg.embed_dim,
-                num_heads=cfg.num_heads,
-                mlp_dim=mlp_dim,
-                dropout=cfg.dropout,
-            )(tokens, deterministic)
+        scanned_encoder = nn.scan(
+            _EncoderBlock,
+            variable_axes={"params": 0},
+            split_rngs={"params": True, "dropout": True},
+            length=cfg.depth,
+        )
+        tokens, _ = scanned_encoder(
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.num_heads,
+            mlp_dim=mlp_dim,
+            dropout=cfg.dropout,
+            deterministic=deterministic,
+            dtype=compute_dtype,
+        )(tokens, None)
 
-        tokens = nn.LayerNorm()(tokens)
-        return tokens[:, 0, :]
+        tokens = nn.LayerNorm(dtype=compute_dtype)(tokens)
+        return tokens[:, 0, :].astype(jnp.float32)
 
     def _positional_embedding(
         self, pos_embed: jnp.ndarray, grid_h: int, grid_w: int

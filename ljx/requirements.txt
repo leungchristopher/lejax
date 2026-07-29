@@ -1,7 +1,6 @@
 jax[cuda12]
 flax
 optax
-nvidia-dali-cuda120
 pillow
 numpy
 pytest
