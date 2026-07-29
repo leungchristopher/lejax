@@ -11,12 +11,17 @@ Dataset must already be materialized (see scripts/materialize_hf_tiny_imagenet.p
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
+
+# Must be set before jax is imported anywhere (including transitively, via
+# ljx.training below) — JAX preallocates ~90% of GPU memory by default, which
+# starves DALI's own CUDA allocations sharing this process.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", ".5")
 
 from ljx.training.eval import EvalConfig, EvalRun
 from ljx.training.train_loop import TrainingConfig, TrainingRun
-
-DRY_RUN_IMAGES = 32
 
 
 def build_parser() -> argparse.ArgumentParser:

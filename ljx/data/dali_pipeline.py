@@ -66,16 +66,22 @@ def multicrop_pipeline(
     file_root: str,
     config: MultiCropConfig,
     shuffle: bool,
-    seed: int,
+    shuffle_seed: int,
     file_list: str | None = None,
 ):
     """2 global (64px) + 6 local (32px) views per image. `file_list` (see
-    tiny_imagenet.split_pretrain_file_lists) selects an explicit split."""
+    tiny_imagenet.split_pretrain_file_lists) selects an explicit split.
+
+    `shuffle_seed` (not `seed` — that name is reserved by DALI's own Pipeline
+    constructor, which `@pipeline_def` already forwards) seeds the reader's
+    shuffle only; other random ops here draw from the pipeline-level seed
+    passed at construction time.
+    """
     jpegs, labels = fn.readers.file(
         file_root=file_root,
         file_list=file_list,
         random_shuffle=shuffle,
-        seed=seed,
+        seed=shuffle_seed,
         name="reader",
     )
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
@@ -100,14 +106,14 @@ def labeled_pipeline(
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
     shuffle: bool,
-    seed: int,
+    shuffle_seed: int,
 ):
     """Resize + centre-crop + normalize, no flip/jitter. For the linear probe."""
     jpegs, labels = fn.readers.file(
         file_root=file_root,
         file_list=file_list,
         random_shuffle=shuffle,
-        seed=seed,
+        seed=shuffle_seed,
         name="reader",
     )
     images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
@@ -148,6 +154,7 @@ def build_labeled_iterator(
         mean=mean,
         std=std,
         shuffle=shuffle,
+        shuffle_seed=seed,
         seed=seed,
         batch_size=batch_size,
         num_threads=num_threads,
@@ -181,6 +188,7 @@ def build_multicrop_iterator(
         file_list=file_list,
         config=config,
         shuffle=shuffle,
+        shuffle_seed=seed,
         seed=seed,
         batch_size=batch_size,
         num_threads=num_threads,

@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from ljx.data.dali_pipeline import build_multicrop_iterator
+from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
 from ljx.training.train_loop import LeJEPATrainState, TrainingConfig, _views_from_batch, train_step
 
@@ -35,12 +35,13 @@ def run_one(
     )
 
     rng = jax.random.PRNGKey(config.seed)
-    first_batch = next(iter(train_iter))
-    global_views, local_views = _views_from_batch(first_batch)
+    crop_config = MultiCropConfig()
+    dummy_global = jnp.zeros((1, crop_config.global_size, crop_config.global_size, 3))
+    dummy_local = jnp.zeros((1, crop_config.local_size, crop_config.local_size, 3))
 
     model = config.model.init()
     variables = model.init(
-        rng, [global_views[0]], [local_views[0]], deterministic=True, use_running_average=True
+        rng, [dummy_global], [dummy_local], deterministic=True, use_running_average=True
     )
     optimizer = optax.adamw(config.learning_rate, weight_decay=config.weight_decay)
     state = LeJEPATrainState.create(

@@ -30,6 +30,7 @@ class TrainingConfig:
     resume_from_epoch: int | None = None
     num_valid_images: int = 1024
     seed: int = 0
+    max_train_images: int | None = None
 
     def dry_run(self) -> "TrainingConfig":
         return replace(
@@ -40,6 +41,7 @@ class TrainingConfig:
             checkpoint_every=None,
             resume_from_epoch=None,
             num_valid_images=8,
+            max_train_images=32,
         )
 
 
@@ -108,6 +110,9 @@ class TrainingRun:
         train_list, valid_list = split_pretrain_file_lists(
             self.dataset_path, config.num_valid_images, self.artifact_directory
         )
+        if config.max_train_images is not None:
+            lines = train_list.read_text().strip().splitlines()[: config.max_train_images]
+            train_list.write_text("\n".join(lines) + "\n")
 
         train_iter = build_multicrop_iterator(
             file_root=str(self.dataset_path),
@@ -138,12 +143,13 @@ class TrainingRun:
         optimizer = optax.adamw(learning_rate=schedule, weight_decay=config.weight_decay)
 
         rng = jax.random.PRNGKey(config.seed)
-        first_batch = next(iter(train_iter))
-        global_views, local_views = _views_from_batch(first_batch)
+        crop_config = MultiCropConfig()
+        dummy_global = jnp.zeros((1, crop_config.global_size, crop_config.global_size, 3))
+        dummy_local = jnp.zeros((1, crop_config.local_size, crop_config.local_size, 3))
 
         model = config.model.init()
         variables = model.init(
-            rng, [global_views[0]], [local_views[0]], deterministic=True, use_running_average=True
+            rng, [dummy_global], [dummy_local], deterministic=True, use_running_average=True
         )
         state = LeJEPATrainState.create(
             apply_fn=model.apply,
