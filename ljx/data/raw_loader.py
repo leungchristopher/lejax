@@ -20,6 +20,14 @@ def _load_image(path: pathlib.Path, size: int) -> np.ndarray:
         return np.asarray(img, dtype=np.float32) / 255.0
 
 
+def _load_image_uint8(path: pathlib.Path, size: int) -> np.ndarray:
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        if img.size != (size, size):
+            img = img.resize((size, size), Image.BILINEAR)
+        return np.asarray(img, dtype=np.uint8)
+
+
 class RawImageLoader:
     """Iterates batches of decoded images as float32 [0, 1] numpy arrays.
 
@@ -84,11 +92,19 @@ class RawImageLoader:
 
 class CachedImageLoader:
     """Decodes the whole `file_list` into RAM once at construction, instead of
-    per-batch like RawImageLoader. Tiny ImageNet fits easily (~1.2GB for
-    100k 64x64 images), so this trades a one-time up-front decode for zero
-    per-step CPU JPEG decode — the actual bottleneck on 2-vCPU Colab
+    per-batch like RawImageLoader. Tiny ImageNet fits easily this way (~1.2GB
+    for 100k 64x64 images at uint8), trading a one-time up-front decode for
+    zero per-step CPU JPEG decode — the actual bottleneck on 2-vCPU Colab
     instances, where RawImageLoader's per-batch decode can't keep the GPU
-    fed no matter how many worker threads you throw at it."""
+    fed no matter how many worker threads you throw at it.
+
+    Stored as uint8 (not float32 [0, 1]) and decoded straight into a
+    preallocated array rather than a Python list handed to np.stack — at
+    float32 with a list-then-stack, the full dataset briefly needs ~2x its
+    resident size (list of arrays + the freshly stacked copy), which is
+    enough to OOM a free-tier Colab instance. Batches come out as uint8;
+    callers convert to float32 [0, 1] on-device after the host->device copy,
+    which is far cheaper there than doing it once per image on 2 CPU cores."""
 
     def __init__(
         self,
@@ -105,9 +121,14 @@ class CachedImageLoader:
             dataset_root / line.split(" ")[0]
             for line in pathlib.Path(file_list).read_text().strip().splitlines()
         ]
+        self.images = np.empty((len(paths), size, size, 3), dtype=np.uint8)
+
+        def _fill(i: int) -> None:
+            self.images[i] = _load_image_uint8(paths[i], size)
+
         with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            images = list(pool.map(lambda p: _load_image(p, size), paths))
-        self.images = np.stack(images, axis=0)
+            list(pool.map(_fill, range(len(paths))))
+
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.rng = random.Random(seed)

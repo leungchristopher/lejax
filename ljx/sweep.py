@@ -67,7 +67,7 @@ def run_one(
         if steps_run >= num_steps:
             break
         rng, step_rng = jax.random.split(rng)
-        images = jnp.asarray(batch)
+        images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
         state, loss = train_step(state, images, step_rng, config.model)
         losses.append(loss.total)
         predictions.append(loss.prediction)

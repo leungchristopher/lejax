@@ -197,7 +197,7 @@ class TrainingRun:
             train_losses, train_predictions, train_sigregs = [], [], []
             for batch in train_loader:
                 rng, step_rng = jax.random.split(rng)
-                images = jnp.asarray(batch)
+                images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
                 state, loss = train_step(state, images, step_rng, config.model)
                 train_losses.append(loss.total)
                 train_predictions.append(loss.prediction)
@@ -206,7 +206,7 @@ class TrainingRun:
             valid_losses, valid_predictions, valid_sigregs = [], [], []
             for batch in valid_loader:
                 rng, step_rng = jax.random.split(rng)
-                images = jnp.asarray(batch)
+                images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
                 loss = eval_step(state, images, step_rng, config.model)
                 valid_losses.append(loss.total)
                 valid_predictions.append(loss.prediction)
