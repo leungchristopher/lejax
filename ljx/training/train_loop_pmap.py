@@ -1,84 +1,45 @@
-"""Pretraining LeJEPA"""
+"""Data-parallel pretraining across multiple local devices (e.g. all 8 cores
+of a TPU v2-8), via jax.pmap.
+
+Config.batch_size in TrainingConfig is per-device here — the effective
+global batch is batch_size * jax.local_device_count(). Gradients (and
+batch_stats) are averaged across devices each step via lax.pmean, so this
+is standard synchronous data parallelism, not model parallelism: the model
+itself must already fit on one core (see the memory estimate in
+docs/tpu_capacity_notes — this ViT-Tiny's params+optimizer state is tens of
+MB, far under a TPU v2 core's 8GB HBM; the real per-core cost is
+activations, which scale with the per-device batch size)."""
 
 from __future__ import annotations
 
 import functools
 import pathlib
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-from flax.training import train_state
+from flax import jax_utils
 
-from ljx.data.jax_augment import ViewConfig, generate_views
+from ljx.data.jax_augment import generate_views
 from ljx.data.raw_loader import CachedImageLoader
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
-from ljx.models.lejepa import LeJEPAConfig, LeJEPALoss, lejepa_loss
+from ljx.models.lejepa import LeJEPALoss, lejepa_loss
 from ljx.training import checkpoint, metrics
-
-GLOBAL_VIEW = ViewConfig(size=64, scale=(0.30, 1.0))
-LOCAL_VIEW = ViewConfig(size=32, scale=(0.05, 0.30))
-NUM_GLOBAL_VIEWS = 2
-# 6 is the DINO/iBOT-style convention the reference repo inherited, tuned for
-# larger-scale pretraining. 4 trades some of that multi-crop signal for ~15%
-# fewer tokens through the MLP/QKV projections per step at this ViT-Tiny/64px
-# scale, where the original ratio is unverified.
-NUM_LOCAL_VIEWS = 4
-
-
-@dataclass(frozen=True)
-class TrainingConfig:
-    model: LeJEPAConfig = field(default_factory=LeJEPAConfig)
-    batch_size: int = 64
-    num_epochs: int = 100
-    learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-6
-    weight_decay: float = 0.05
-    num_workers: int = 4
-    checkpoint_every: int | None = 10
-    resume_from_epoch: int | None = None
-    num_valid_images: int = 1024
-    seed: int = 0
-    max_train_images: int | None = None
-    # Static loss scaling: multiply the loss before backward, divide grads by
-    # the same factor after, so small gradients don't underflow fp16's narrow
-    # exponent range during backprop (params/opt_state stay fp32 regardless —
-    # this only protects the fp16-computed intermediate activations/grads).
-    # 1.0 (default, matches bfloat16's full fp32 exponent range) is a no-op.
-    # Unlike flax's DynamicScale, there's no per-step is_finite check or
-    # param/opt_state jnp.where-select — that tree-reduction chain was the
-    # single largest per-step cost measured on this project (~6.5x), so a
-    # fixed scale trades DynamicScale's adaptivity for a flat, cheap constant.
-    loss_scale: float = 1.0
-
-    def dry_run(self) -> "TrainingConfig":
-        return replace(
-            self,
-            num_epochs=1,
-            batch_size=min(self.batch_size, 8),
-            num_workers=1,
-            checkpoint_every=None,
-            resume_from_epoch=None,
-            num_valid_images=8,
-            max_train_images=32,
-        )
+from ljx.training.train_loop import (
+    GLOBAL_VIEW,
+    LOCAL_VIEW,
+    NUM_GLOBAL_VIEWS,
+    NUM_LOCAL_VIEWS,
+    LeJEPATrainState,
+    TrainingConfig,
+)
 
 
-class LeJEPATrainState(train_state.TrainState):
-    batch_stats: dict
-    sigreg_step: jnp.ndarray
-
-
-@functools.partial(jax.jit, static_argnames=("config", "loss_scale"), donate_argnums=(0,))
-def train_step(
-    state: LeJEPATrainState,
-    images: jnp.ndarray,
-    rng: jax.Array,
-    config: LeJEPAConfig,
-    loss_scale: float = 1.0,
-) -> tuple[LeJEPATrainState, LeJEPALoss]:
+@functools.partial(jax.pmap, axis_name="devices", static_broadcasted_argnums=(3, 4))
+def pmap_train_step(state, images, rng, config, loss_scale=1.0):
     def loss_fn(params):
         variables = {"params": params, "batch_stats": state.batch_stats}
         rng_global, rng_local = jax.random.split(rng)
@@ -97,13 +58,11 @@ def train_step(
         return scaled_total, (loss, mutated["batch_stats"])
 
     (_, (loss, batch_stats)), scaled_grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    # loss_scale is a static float (in static_argnames) — this branch costs
-    # nothing at trace time when unused, same pattern as _EncoderBlock's
-    # dropout skip.
-    if loss_scale != 1.0:
-        grads = jax.tree_util.tree_map(lambda g: g / loss_scale, scaled_grads)
-    else:
-        grads = scaled_grads
+    grads = scaled_grads if loss_scale == 1.0 else jax.tree_util.tree_map(lambda g: g / loss_scale, scaled_grads)
+
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    batch_stats = jax.lax.pmean(batch_stats, axis_name="devices")
+    loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="devices"), loss)
 
     state = state.apply_gradients(grads=grads).replace(
         batch_stats=batch_stats,
@@ -112,13 +71,8 @@ def train_step(
     return state, loss
 
 
-@functools.partial(jax.jit, static_argnames=("config",))
-def eval_step(
-    state: LeJEPATrainState,
-    images: jnp.ndarray,
-    rng: jax.Array,
-    config: LeJEPAConfig,
-) -> LeJEPALoss:
+@functools.partial(jax.pmap, axis_name="devices", static_broadcasted_argnums=(3,))
+def pmap_eval_step(state, images, rng, config):
     variables = {"params": state.params, "batch_stats": state.batch_stats}
     rng_global, rng_local = jax.random.split(rng)
     global_views = list(generate_views(rng_global, images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
@@ -126,18 +80,33 @@ def eval_step(
     projections = state.apply_fn(
         variables, global_views, local_views, deterministic=True, use_running_average=True
     )
-    return lejepa_loss(projections, config, state.sigreg_step)
+    loss = lejepa_loss(projections, config, state.sigreg_step)
+    return jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="devices"), loss)
 
 
-class TrainingRun:
+def _device_grouped_batches(loader, num_devices: int):
+    """Groups exactly num_devices consecutive loader batches into one stack
+    with a leading device axis — the shape pmap shards across devices.
+    Drops a final partial group (pmap needs a fixed device-axis size)."""
+    group = []
+    for batch in loader:
+        group.append(batch)
+        if len(group) == num_devices:
+            yield np.stack(group, axis=0)
+            group = []
+
+
+class PmapTrainingRun:
     def __init__(self, config: TrainingConfig, dataset_path: pathlib.Path, artifact_directory: pathlib.Path):
         self.config = config
         self.dataset_path = pathlib.Path(dataset_path)
         self.artifact_directory = pathlib.Path(artifact_directory)
         self.artifact_directory.mkdir(parents=True, exist_ok=True)
+        self.num_devices = jax.local_device_count()
 
     def launch(self) -> None:
         config = self.config
+        num_devices = self.num_devices
         train_list, valid_list = split_pretrain_file_lists(
             self.dataset_path, config.num_valid_images, self.artifact_directory
         )
@@ -155,7 +124,7 @@ class TrainingRun:
         )
 
         num_train_images = sum(1 for _ in train_list.read_text().strip().splitlines())
-        steps_per_epoch = max(len(train_loader), 1)
+        steps_per_epoch = max(len(train_loader) // num_devices, 1)
         total_steps = max(steps_per_epoch * config.num_epochs, 1)
 
         schedule = optax.cosine_decay_schedule(
@@ -183,9 +152,6 @@ class TrainingRun:
             sigreg_step=jnp.array(0, dtype=jnp.uint32),
         )
 
-        metrics.dump_config(self.artifact_directory, config)
-        logger = metrics.MetricsLogger(self.artifact_directory)
-
         start_epoch = 1
         checkpoint_dir = self.artifact_directory / "checkpoint"
         if config.resume_from_epoch is not None:
@@ -200,26 +166,32 @@ class TrainingRun:
             state = state.replace(**restored)
             start_epoch = config.resume_from_epoch + 1
 
+        state = jax_utils.replicate(state)
+        metrics.dump_config(self.artifact_directory, config)
+        logger = metrics.MetricsLogger(self.artifact_directory)
+
         for epoch in range(start_epoch, config.num_epochs + 1):
             epoch_start = time.time()
 
             train_losses, train_predictions, train_sigregs = [], [], []
-            for batch in train_loader:
+            for batch_group in _device_grouped_batches(train_loader, num_devices):
                 rng, step_rng = jax.random.split(rng)
-                images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
-                state, loss = train_step(state, images, step_rng, config.model, config.loss_scale)
-                train_losses.append(loss.total)
-                train_predictions.append(loss.prediction)
-                train_sigregs.append(loss.sigreg)
+                device_rngs = jax.random.split(step_rng, num_devices)
+                images = jnp.asarray(batch_group, dtype=jnp.float32) / 255.0
+                state, loss = pmap_train_step(state, images, device_rngs, config.model, config.loss_scale)
+                train_losses.append(loss.total[0])
+                train_predictions.append(loss.prediction[0])
+                train_sigregs.append(loss.sigreg[0])
 
             valid_losses, valid_predictions, valid_sigregs = [], [], []
-            for batch in valid_loader:
+            for batch_group in _device_grouped_batches(valid_loader, num_devices):
                 rng, step_rng = jax.random.split(rng)
-                images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
-                loss = eval_step(state, images, step_rng, config.model)
-                valid_losses.append(loss.total)
-                valid_predictions.append(loss.prediction)
-                valid_sigregs.append(loss.sigreg)
+                device_rngs = jax.random.split(step_rng, num_devices)
+                images = jnp.asarray(batch_group, dtype=jnp.float32) / 255.0
+                loss = pmap_eval_step(state, images, device_rngs, config.model)
+                valid_losses.append(loss.total[0])
+                valid_predictions.append(loss.prediction[0])
+                valid_sigregs.append(loss.sigreg[0])
 
             def _mean(values):
                 return float(jnp.mean(jnp.stack(values))) if values else float("nan")
@@ -247,13 +219,14 @@ class TrainingRun:
                 epoch % config.checkpoint_every == 0 or epoch == config.num_epochs
             )
             if should_checkpoint:
+                unreplicated = jax_utils.unreplicate(state)
                 checkpoint.save(
                     checkpoint_dir,
                     epoch,
                     {
-                        "params": state.params,
-                        "batch_stats": state.batch_stats,
-                        "opt_state": state.opt_state,
-                        "sigreg_step": state.sigreg_step,
+                        "params": unreplicated.params,
+                        "batch_stats": unreplicated.batch_stats,
+                        "opt_state": unreplicated.opt_state,
+                        "sigreg_step": unreplicated.sigreg_step,
                     },
                 )
