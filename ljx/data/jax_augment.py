@@ -1,5 +1,5 @@
-"""Multi-crop augmentation as pure JAX ops. No DALI; CPU only decodes JPEGs
-(raw_loader.py), crop/resize/flip/jitter/normalize run here on-device.
+"""Multi-crop augmentation as pure JAX ops. CPU only decodes JPEGs
+(raw_loader.py); crop/resize/flip/jitter/normalize run here on-device.
 """
 
 from __future__ import annotations

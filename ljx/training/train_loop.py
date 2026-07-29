@@ -13,9 +13,16 @@ import optax
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import train_state
 
+from ljx.data.jax_augment import ViewConfig, generate_views
+from ljx.data.raw_loader import CachedImageLoader
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
-from ljx.models.lejepa import LeJEPA, LeJEPAConfig, LeJEPALoss, lejepa_loss
+from ljx.models.lejepa import LeJEPAConfig, LeJEPALoss, lejepa_loss
 from ljx.training import checkpoint, metrics
+
+GLOBAL_VIEW = ViewConfig(size=64, scale=(0.30, 1.0))
+LOCAL_VIEW = ViewConfig(size=32, scale=(0.05, 0.30))
+NUM_GLOBAL_VIEWS = 2
+NUM_LOCAL_VIEWS = 6
 
 
 @dataclass(frozen=True)
@@ -26,7 +33,7 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     min_learning_rate: float = 1e-6
     weight_decay: float = 0.05
-    num_workers: int = 4  # DALI num_threads
+    num_workers: int = 4
     checkpoint_every: int | None = 10
     resume_from_epoch: int | None = None
     num_valid_images: int = 1024
@@ -52,23 +59,18 @@ class LeJEPATrainState(train_state.TrainState):
     dynamic_scale: dynamic_scale_lib.DynamicScale
 
 
-def _views_from_batch(batch: dict) -> tuple[list[jnp.ndarray], list[jnp.ndarray]]:
-    from ljx.data.dali_pipeline import NUM_GLOBAL_VIEWS, NUM_LOCAL_VIEWS
-
-    globals_ = [batch[f"global_{i}"] for i in range(NUM_GLOBAL_VIEWS)]
-    locals_ = [batch[f"local_{i}"] for i in range(NUM_LOCAL_VIEWS)]
-    return globals_, locals_
-
-
 @functools.partial(jax.jit, static_argnames=("config",))
 def train_step(
     state: LeJEPATrainState,
-    global_views: list[jnp.ndarray],
-    local_views: list[jnp.ndarray],
+    images: jnp.ndarray,
+    rng: jax.Array,
     config: LeJEPAConfig,
 ) -> tuple[LeJEPATrainState, LeJEPALoss]:
     def loss_fn(params):
         variables = {"params": params, "batch_stats": state.batch_stats}
+        rng_global, rng_local = jax.random.split(rng)
+        global_views = list(generate_views(rng_global, images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
+        local_views = list(generate_views(rng_local, images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
         projections, mutated = state.apply_fn(
             variables,
             global_views,
@@ -102,11 +104,14 @@ def train_step(
 @functools.partial(jax.jit, static_argnames=("config",))
 def eval_step(
     state: LeJEPATrainState,
-    global_views: list[jnp.ndarray],
-    local_views: list[jnp.ndarray],
+    images: jnp.ndarray,
+    rng: jax.Array,
     config: LeJEPAConfig,
 ) -> LeJEPALoss:
     variables = {"params": state.params, "batch_stats": state.batch_stats}
+    rng_global, rng_local = jax.random.split(rng)
+    global_views = list(generate_views(rng_global, images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
+    local_views = list(generate_views(rng_local, images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
     projections = state.apply_fn(
         variables, global_views, local_views, deterministic=True, use_running_average=True
     )
@@ -121,8 +126,6 @@ class TrainingRun:
         self.artifact_directory.mkdir(parents=True, exist_ok=True)
 
     def launch(self) -> None:
-        from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
-
         config = self.config
         train_list, valid_list = split_pretrain_file_lists(
             self.dataset_path, config.num_valid_images, self.artifact_directory
@@ -131,25 +134,17 @@ class TrainingRun:
             lines = train_list.read_text().strip().splitlines()[: config.max_train_images]
             train_list.write_text("\n".join(lines) + "\n")
 
-        train_iter = build_multicrop_iterator(
-            file_root=str(self.dataset_path),
-            file_list=str(train_list),
-            batch_size=config.batch_size,
-            num_threads=config.num_workers,
-            seed=config.seed,
-            shuffle=True,
+        train_loader = CachedImageLoader(
+            train_list, self.dataset_path, config.batch_size,
+            shuffle=True, seed=config.seed, num_workers=config.num_workers,
         )
-        valid_iter = build_multicrop_iterator(
-            file_root=str(self.dataset_path),
-            file_list=str(valid_list),
-            batch_size=config.batch_size,
-            num_threads=config.num_workers,
-            seed=config.seed,
-            shuffle=False,
+        valid_loader = CachedImageLoader(
+            valid_list, self.dataset_path, config.batch_size,
+            shuffle=False, seed=config.seed, num_workers=config.num_workers,
         )
 
         num_train_images = sum(1 for _ in train_list.read_text().strip().splitlines())
-        steps_per_epoch = max(-(-num_train_images // config.batch_size), 1)
+        steps_per_epoch = max(len(train_loader), 1)
         total_steps = max(steps_per_epoch * config.num_epochs, 1)
 
         schedule = optax.cosine_decay_schedule(
@@ -160,13 +155,14 @@ class TrainingRun:
         optimizer = optax.adamw(learning_rate=schedule, weight_decay=config.weight_decay)
 
         rng = jax.random.PRNGKey(config.seed)
-        crop_config = MultiCropConfig()
-        dummy_global = jnp.zeros((1, crop_config.global_size, crop_config.global_size, 3))
-        dummy_local = jnp.zeros((1, crop_config.local_size, crop_config.local_size, 3))
+        rng, init_rng = jax.random.split(rng)
+        dummy_images = jnp.zeros((1, 64, 64, 3))
+        dummy_global = list(generate_views(init_rng, dummy_images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
+        dummy_local = list(generate_views(init_rng, dummy_images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
 
         model = config.model.init()
         variables = model.init(
-            rng, [dummy_global], [dummy_local], deterministic=True, use_running_average=True
+            init_rng, dummy_global, dummy_local, deterministic=True, use_running_average=True
         )
         state = LeJEPATrainState.create(
             apply_fn=model.apply,
@@ -199,17 +195,19 @@ class TrainingRun:
             epoch_start = time.time()
 
             train_losses, train_predictions, train_sigregs = [], [], []
-            for batch in train_iter:
-                global_views, local_views = _views_from_batch(batch)
-                state, loss = train_step(state, global_views, local_views, config.model)
+            for batch in train_loader:
+                rng, step_rng = jax.random.split(rng)
+                images = jnp.asarray(batch)
+                state, loss = train_step(state, images, step_rng, config.model)
                 train_losses.append(loss.total)
                 train_predictions.append(loss.prediction)
                 train_sigregs.append(loss.sigreg)
 
             valid_losses, valid_predictions, valid_sigregs = [], [], []
-            for batch in valid_iter:
-                global_views, local_views = _views_from_batch(batch)
-                loss = eval_step(state, global_views, local_views, config.model)
+            for batch in valid_loader:
+                rng, step_rng = jax.random.split(rng)
+                images = jnp.asarray(batch)
+                loss = eval_step(state, images, step_rng, config.model)
                 valid_losses.append(loss.total)
                 valid_predictions.append(loss.prediction)
                 valid_sigregs.append(loss.sigreg)

@@ -1,9 +1,9 @@
 """
 Tiny ImageNet path/label handling for the labeled (probe) pipeline.
 
-train/ is one directory per class (DALI labels it automatically); val/ is
-flat plus val_annotations.txt, so this builds an explicit file_list for it
-using the same alphabetical class order DALI's file_root reader uses.
+train/ is one directory per class; val/ is flat plus val_annotations.txt.
+Both need an explicit file_list built here, sharing the same alphabetical
+class order as class_names() so train and val label indices line up.
 """
 
 from __future__ import annotations
@@ -68,8 +68,9 @@ def split_pretrain_file_lists(
     dataset_path: pathlib.Path, num_valid_images: int, artifact_directory: pathlib.Path
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Sorted recursive scan, tail split off as validation. Writes two
-    file_list manifests (relative paths, dummy label — DALI's reader
-    requires some label column) under artifact_directory."""
+    file_list manifests (relative paths, dummy label — pretraining doesn't
+    use labels, but raw_loader.py's `<path> <label>` format needs the column)
+    under artifact_directory."""
     dataset_path = pathlib.Path(dataset_path)
     artifact_directory = pathlib.Path(artifact_directory)
 

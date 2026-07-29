@@ -82,11 +82,53 @@ class RawImageLoader:
             yield item
 
 
+class CachedImageLoader:
+    """Decodes the whole `file_list` into RAM once at construction, instead of
+    per-batch like RawImageLoader. Tiny ImageNet fits easily (~1.2GB for
+    100k 64x64 images), so this trades a one-time up-front decode for zero
+    per-step CPU JPEG decode — the actual bottleneck on 2-vCPU Colab
+    instances, where RawImageLoader's per-batch decode can't keep the GPU
+    fed no matter how many worker threads you throw at it."""
+
+    def __init__(
+        self,
+        file_list: pathlib.Path,
+        dataset_root: pathlib.Path,
+        batch_size: int,
+        size: int = 64,
+        shuffle: bool = True,
+        seed: int = 0,
+        num_workers: int = 4,
+    ):
+        dataset_root = pathlib.Path(dataset_root)
+        paths = [
+            dataset_root / line.split(" ")[0]
+            for line in pathlib.Path(file_list).read_text().strip().splitlines()
+        ]
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            images = list(pool.map(lambda p: _load_image(p, size), paths))
+        self.images = np.stack(images, axis=0)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.rng = random.Random(seed)
+
+    def __len__(self) -> int:
+        return len(self.images) // self.batch_size
+
+    def __iter__(self):
+        order = list(range(len(self.images)))
+        if self.shuffle:
+            self.rng.shuffle(order)
+
+        for i in range(0, len(order) - self.batch_size + 1, self.batch_size):
+            yield self.images[order[i : i + self.batch_size]]
+
+
 class LabeledImageLoader(RawImageLoader):
     """Same batching/prefetch as RawImageLoader, but also yields the label
     column from `file_list` (`<relative path> <label>` — label used here,
-    unlike RawImageLoader's pretraining split lists, which just need a
-    label-shaped column for the DALI-derived file_list format)."""
+    unlike RawImageLoader's pretraining split lists, whose label column is
+    just a placeholder to match this shared file_list format)."""
 
     def __init__(self, file_list: pathlib.Path, dataset_root: pathlib.Path, batch_size: int, **kwargs):
         super().__init__(file_list, dataset_root, batch_size, **kwargs)
