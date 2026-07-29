@@ -13,7 +13,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from flax import linen as nn
 
-from ljx.losses.sigreg import SigRegConfig, sigreg_loss_at_step
+from ljx.losses.sigreg import SigRegConfig, sigreg_loss_multi_view
 from ljx.models.backbone import ViT, ViTConfig
 from ljx.models.projector import Projector, ProjectorConfig
 
@@ -87,15 +87,25 @@ class LeJEPA(nn.Module):
         deterministic: bool = True,
         use_running_average: bool = True,
     ) -> list[jnp.ndarray]:
-        views = list(global_views) + list(local_views)
-        if not views:
+        global_views = list(global_views)
+        local_views = list(local_views)
+        if not global_views and not local_views:
             raise ValueError("LeJEPA needs at least one view to train on")
-        return [
-            self.encode_and_project(
-                view, deterministic=deterministic, use_running_average=use_running_average
+
+        # Views within a group share a resolution, so they can be concatenated
+        # into one batched forward pass instead of one call per view — same
+        # per-image result (nothing in the ViT mixes across the batch axis),
+        # far fewer kernel launches.
+        projections = []
+        for views in (global_views, local_views):
+            if not views:
+                continue
+            stacked = jnp.concatenate(views, axis=0)
+            projection = self.encode_and_project(
+                stacked, deterministic=deterministic, use_running_average=use_running_average
             ).projection
-            for view in views
-        ]
+            projections.extend(jnp.split(projection, len(views), axis=0))
+        return projections
 
 
 def invariance_loss(projections: list[jnp.ndarray]) -> jnp.ndarray:
@@ -112,10 +122,6 @@ def lejepa_loss(
         raise ValueError("LeJEPA needs at least one view to train on")
 
     prediction = invariance_loss(projections)
-    sigreg = jnp.mean(
-        jnp.stack(
-            [sigreg_loss_at_step(config.sigreg, p, step) for p in projections]
-        )
-    )
+    sigreg = jnp.mean(sigreg_loss_multi_view(config.sigreg, jnp.stack(projections, axis=0), step))
     total = (1.0 - config.lejepa_lambda) * prediction + config.lejepa_lambda * sigreg
     return LeJEPALoss(total=total, prediction=prediction, sigreg=sigreg)

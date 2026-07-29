@@ -103,3 +103,33 @@ def sigreg_loss_at_step(
 
 def sigreg_loss(embeddings: jnp.ndarray, num_projections: int, step: int = 0) -> jnp.ndarray:
     return sigreg_loss_at_step(SigRegConfig(num_projections=num_projections), embeddings, step)
+
+
+def sigreg_loss_multi_view(
+    config: SigRegConfig, embeddings_stack: jnp.ndarray, step: int, exact: bool = False
+) -> jnp.ndarray:
+    """embeddings_stack: [views, batch, dim] -> [views], one statistic per view.
+
+    Each view gets its own independent goodness-of-fit statistic over the
+    same slice directions (directions depend only on (seed, step), not on the
+    view) — not pooled across views. Directions are computed once here and
+    the per-view statistic is vmapped, instead of a Python loop that would
+    recompute the identical direction matrix once per view.
+    """
+    views, batch, dim = embeddings_stack.shape
+    if batch == 0:
+        raise ValueError("SigReg requires a non-empty batch")
+    directions = _directions(config, dim, step)
+
+    def _per_view(embeddings):
+        samples = (embeddings @ directions).T
+        statistics = (
+            _epps_pulley_exact(samples)
+            if exact
+            else _epps_pulley_quadrature(samples, config.t_max, config.n_points)
+        )
+        if config.clip_value is not None:
+            statistics = jnp.where(statistics < config.clip_value, 0.0, statistics)
+        return jnp.mean(statistics)
+
+    return jax.vmap(_per_view)(embeddings_stack)

@@ -21,7 +21,7 @@ import pathlib
 # which is much slower. Cap the preallocated pool instead: JAX takes a fixed
 # slice once at startup, DALI gets the rest.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", ".5")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", ".8")
 
 from ljx.training.eval import EvalConfig, EvalRun
 from ljx.training.train_loop import TrainingConfig, TrainingRun

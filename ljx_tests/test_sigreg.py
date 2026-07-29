@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from ljx.losses.sigreg import SigRegConfig, sigreg_loss, sigreg_loss_at_step
+from ljx.losses.sigreg import SigRegConfig, sigreg_loss, sigreg_loss_at_step, sigreg_loss_multi_view
 
 
 def normal(key, batch, dim):
@@ -68,3 +68,35 @@ def test_quadrature_matches_exact_on_a_fine_grid():
 def test_rejects_even_n_points():
     with pytest.raises(ValueError):
         SigRegConfig(n_points=16)
+
+
+def test_multi_view_matches_per_view_loop():
+    key = jax.random.PRNGKey(11)
+    keys = jax.random.split(key, 5)
+    views = [normal(k, 32, 64) for k in keys]
+    config = SigRegConfig(num_projections=32, seed=3, clip_value=0.5)
+
+    per_view = jnp.stack([sigreg_loss_at_step(config, v, 4) for v in views])
+    batched = sigreg_loss_multi_view(config, jnp.stack(views, axis=0), 4)
+
+    assert jnp.allclose(per_view, batched, atol=1e-5)
+
+
+def test_multi_view_gradient_matches_per_view_loop():
+    key = jax.random.PRNGKey(13)
+    keys = jax.random.split(key, 3)
+    views = [normal(k, 16, 32) for k in keys]
+    config = SigRegConfig(num_projections=16, seed=5)
+
+    def per_view_loss(views):
+        return jnp.mean(jnp.stack([sigreg_loss_at_step(config, v, 2) for v in views]))
+
+    def batched_loss(views_stack):
+        return jnp.mean(sigreg_loss_multi_view(config, views_stack, 2))
+
+    stacked = jnp.stack(views, axis=0)
+    per_view_grad = jax.grad(per_view_loss)(views)
+    batched_grad = jax.grad(batched_loss)(stacked)
+
+    for a, b in zip(per_view_grad, batched_grad):
+        assert jnp.allclose(a, b, atol=1e-5)
