@@ -39,7 +39,7 @@ def native_train_step(state, images, rng, config):
         loss = lejepa_loss(projections, config, state.sigreg_step)
         return loss.total, (loss, mutated["batch_stats"])
 
-    dynamic_scale, finite, (loss, batch_stats), grads = state.dynamic_scale.value_and_grad(
+    dynamic_scale, finite, (_, (loss, batch_stats)), grads = state.dynamic_scale.value_and_grad(
         loss_fn, has_aux=True
     )(state.params)
 
