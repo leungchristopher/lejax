@@ -1,0 +1,33 @@
+import time
+
+from ljx.data.dali_pipeline import build_multicrop_iterator
+from ljx.data.tiny_imagenet import split_pretrain_file_lists
+from ljx.training.train_loop import TrainingConfig, _views_from_batch
+
+config = TrainingConfig()
+dataset_path = "/content/datasets/tiny-imagenet-200/train"
+
+train_list, _ = split_pretrain_file_lists(dataset_path, config.num_valid_images, "/content/dali_timing")
+
+train_iter = build_multicrop_iterator(
+    file_root=dataset_path,
+    file_list=str(train_list),
+    batch_size=config.batch_size,
+    num_threads=config.num_workers,
+    seed=config.seed,
+    shuffle=True,
+)
+
+it = iter(train_iter)
+next(it)  # warmup: first batch pays pipeline build cost, exclude it
+
+num_steps = 50
+start = time.time()
+for _ in range(num_steps):
+    batch = next(it)
+    global_views, local_views = _views_from_batch(batch)
+seconds = time.time() - start
+
+per_step = seconds / num_steps
+print(f"DALI only: {per_step * 1000:.1f} ms/step, {config.batch_size / per_step:.0f} images/s")
+print("compare against the 1768.2 ms/step train_step number — the gap (if any) is JAX compute/sync cost")

@@ -15,9 +15,12 @@ import os
 import pathlib
 
 # Must be set before jax is imported anywhere (including transitively, via
-# ljx.training below) — JAX preallocates ~90% of GPU memory by default, which
-# starves DALI's own CUDA allocations sharing this process.
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# ljx.training below). JAX preallocates ~90% of GPU memory by default, which
+# starves DALI's own CUDA allocations sharing this process — but disabling
+# preallocation entirely forces an on-demand cudaMalloc/cudaFree every step,
+# which is much slower. Cap the preallocated pool instead: JAX takes a fixed
+# slice once at startup, DALI gets the rest.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", ".5")
 
 from ljx.training.eval import EvalConfig, EvalRun
