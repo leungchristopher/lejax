@@ -19,6 +19,20 @@ def class_names(train_root: pathlib.Path) -> list[str]:
     return names
 
 
+def build_train_file_list(dataset_root: pathlib.Path, class_to_index: dict[str, int]) -> pathlib.Path:
+    """train/<wnid>/images/*.jpeg -> explicit file_list, same layout as
+    build_val_file_list, so both feed the same labeled loader."""
+    train_root = pathlib.Path(dataset_root) / "train"
+    lines = []
+    for wnid, index in class_to_index.items():
+        for image_path in sorted((train_root / wnid / "images").glob("*.jpeg")):
+            lines.append(f"{wnid}/images/{image_path.name} {index}")
+
+    file_list = train_root / "file_list.txt"
+    file_list.write_text("\n".join(lines) + "\n")
+    return file_list
+
+
 def build_val_file_list(dataset_root: pathlib.Path, class_to_index: dict[str, int]) -> pathlib.Path:
     """val_annotations.txt line: <filename>\\t<wnid>\\t<x0>\\t<y0>\\t<x1>\\t<y1>."""
     val_root = pathlib.Path(dataset_root) / "val"

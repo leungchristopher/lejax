@@ -13,7 +13,6 @@ import optax
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import train_state
 
-from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
 from ljx.models.lejepa import LeJEPA, LeJEPAConfig, LeJEPALoss, lejepa_loss
 from ljx.training import checkpoint, metrics
@@ -122,6 +121,8 @@ class TrainingRun:
         self.artifact_directory.mkdir(parents=True, exist_ok=True)
 
     def launch(self) -> None:
+        from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
+
         config = self.config
         train_list, valid_list = split_pretrain_file_lists(
             self.dataset_path, config.num_valid_images, self.artifact_directory

@@ -15,7 +15,6 @@ from flax.traverse_util import path_aware_map
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import train_state
 
-from ljx.data.dali_pipeline import build_labeled_iterator
 from ljx.data.tiny_imagenet import build_val_file_list, class_names
 from ljx.models.lejepa import LeJEPAConfig
 from ljx.models.linear import LinearClassifier, LinearClassifierConfig
@@ -108,6 +107,8 @@ class EvalRun:
         return len(self.classes)
 
     def launch(self) -> None:
+        from ljx.data.dali_pipeline import build_labeled_iterator
+
         config = self.config
         class_to_index = {name: i for i, name in enumerate(self.classes)}
         val_file_list = build_val_file_list(self.dataset_root, class_to_index)
