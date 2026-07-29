@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import pathlib
+import time
 from dataclasses import dataclass, field, replace
 
 import jax
@@ -14,7 +15,7 @@ from flax.training import train_state
 from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
 from ljx.models.lejepa import LeJEPA, LeJEPAConfig, LeJEPALoss, lejepa_loss
-from ljx.training import checkpoint
+from ljx.training import checkpoint, metrics
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,9 @@ class TrainingRun:
             sigreg_step=jnp.array(0, dtype=jnp.uint32),
         )
 
+        metrics.dump_config(self.artifact_directory, config)
+        logger = metrics.MetricsLogger(self.artifact_directory)
+
         start_epoch = 1
         checkpoint_dir = self.artifact_directory / "checkpoint"
         if config.resume_from_epoch is not None:
@@ -174,21 +178,45 @@ class TrainingRun:
             start_epoch = config.resume_from_epoch + 1
 
         for epoch in range(start_epoch, config.num_epochs + 1):
-            train_losses = []
+            epoch_start = time.time()
+
+            train_losses, train_predictions, train_sigregs = [], [], []
             for batch in train_iter:
                 global_views, local_views = _views_from_batch(batch)
                 state, loss = train_step(state, global_views, local_views, config.model)
                 train_losses.append(loss.total)
+                train_predictions.append(loss.prediction)
+                train_sigregs.append(loss.sigreg)
 
-            valid_losses = []
+            valid_losses, valid_predictions, valid_sigregs = [], [], []
             for batch in valid_iter:
                 global_views, local_views = _views_from_batch(batch)
                 loss = eval_step(state, global_views, local_views, config.model)
                 valid_losses.append(loss.total)
+                valid_predictions.append(loss.prediction)
+                valid_sigregs.append(loss.sigreg)
 
-            train_mean = float(jnp.mean(jnp.stack(train_losses)))
-            valid_mean = float(jnp.mean(jnp.stack(valid_losses))) if valid_losses else float("nan")
-            print(f"epoch {epoch}/{config.num_epochs}: train_loss={train_mean:.4f} valid_loss={valid_mean:.4f}")
+            def _mean(values):
+                return float(jnp.mean(jnp.stack(values))) if values else float("nan")
+
+            train_mean = _mean(train_losses)
+            valid_mean = _mean(valid_losses)
+            print(
+                f"epoch {epoch}/{config.num_epochs}: "
+                f"train_loss={train_mean:.4f} (pred={_mean(train_predictions):.4f} sigreg={_mean(train_sigregs):.4f}) "
+                f"valid_loss={valid_mean:.4f} (pred={_mean(valid_predictions):.4f} sigreg={_mean(valid_sigregs):.4f})"
+            )
+
+            logger.log(
+                epoch=epoch,
+                epoch_seconds=time.time() - epoch_start,
+                train_loss=train_mean,
+                train_prediction=_mean(train_predictions),
+                train_sigreg=_mean(train_sigregs),
+                valid_loss=valid_mean,
+                valid_prediction=_mean(valid_predictions),
+                valid_sigreg=_mean(valid_sigregs),
+            )
 
             should_checkpoint = config.checkpoint_every is not None and (
                 epoch % config.checkpoint_every == 0 or epoch == config.num_epochs

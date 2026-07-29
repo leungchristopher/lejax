@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import pathlib
+import time
 from dataclasses import dataclass, field, replace
 
 import jax
@@ -17,7 +18,7 @@ from ljx.data.dali_pipeline import build_labeled_iterator
 from ljx.data.tiny_imagenet import build_val_file_list, class_names
 from ljx.models.lejepa import LeJEPAConfig
 from ljx.models.linear import LinearClassifier, LinearClassifierConfig
-from ljx.training import checkpoint
+from ljx.training import checkpoint, metrics
 
 
 @dataclass(frozen=True)
@@ -140,7 +141,15 @@ class EvalRun:
 
         state = ProbeState.create(apply_fn=classifier.apply, params=params, tx=_optimizer(config))
 
+        metrics.dump_config(self.artifact_directory, config)
+        logger = metrics.MetricsLogger(self.artifact_directory)
+
+        def _mean(values):
+            return float(jnp.mean(jnp.stack(values))) if values else float("nan")
+
         for epoch in range(1, config.num_epochs + 1):
+            epoch_start = time.time()
+
             train_losses, train_acc = [], []
             for batch in train_iter:
                 state, loss, acc = train_step(state, batch["images"], batch["labels"])
@@ -155,7 +164,15 @@ class EvalRun:
 
             print(
                 f"probe epoch {epoch}/{config.num_epochs}: "
-                f"train_loss={float(jnp.mean(jnp.stack(train_losses))):.4f} "
-                f"train_acc={float(jnp.mean(jnp.stack(train_acc))):.4f} "
-                f"valid_acc={float(jnp.mean(jnp.stack(valid_acc))) if valid_acc else float('nan'):.4f}"
+                f"train_loss={_mean(train_losses):.4f} "
+                f"train_acc={_mean(train_acc):.4f} "
+                f"valid_acc={_mean(valid_acc):.4f}"
+            )
+
+            logger.log(
+                epoch=epoch,
+                epoch_seconds=time.time() - epoch_start,
+                train_loss=_mean(train_losses),
+                train_acc=_mean(train_acc),
+                valid_acc=_mean(valid_acc),
             )
