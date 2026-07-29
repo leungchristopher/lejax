@@ -9,7 +9,6 @@ from dataclasses import dataclass, field, replace
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from flax.training import train_state
 
@@ -22,7 +21,11 @@ from ljx.training import checkpoint, metrics
 GLOBAL_VIEW = ViewConfig(size=64, scale=(0.30, 1.0))
 LOCAL_VIEW = ViewConfig(size=32, scale=(0.05, 0.30))
 NUM_GLOBAL_VIEWS = 2
-NUM_LOCAL_VIEWS = 6
+# 6 is the DINO/iBOT-style convention the reference repo inherited, tuned for
+# larger-scale pretraining. 4 trades some of that multi-crop signal for ~15%
+# fewer tokens through the MLP/QKV projections per step at this ViT-Tiny/64px
+# scale, where the original ratio is unverified.
+NUM_LOCAL_VIEWS = 4
 
 
 @dataclass(frozen=True)
@@ -39,12 +42,6 @@ class TrainingConfig:
     num_valid_images: int = 1024
     seed: int = 0
     max_train_images: int | None = None
-    # How many train_step/eval_step calls to fuse into one jax.lax.scan under
-    # a single jit dispatch. 1 (default) keeps the original per-step host
-    # round-trip; >1 is for when step time is dominated by fixed per-step
-    # host<->device latency rather than compute — fusing N steps means the
-    # host only synchronizes once per N steps instead of once per step.
-    steps_per_call: int = 1
 
     def dry_run(self) -> "TrainingConfig":
         return replace(
@@ -64,7 +61,7 @@ class LeJEPATrainState(train_state.TrainState):
     sigreg_step: jnp.ndarray
 
 
-@functools.partial(jax.jit, static_argnames=("config",))
+@functools.partial(jax.jit, static_argnames=("config",), donate_argnums=(0,))
 def train_step(
     state: LeJEPATrainState,
     images: jnp.ndarray,
@@ -111,59 +108,6 @@ def eval_step(
         variables, global_views, local_views, deterministic=True, use_running_average=True
     )
     return lejepa_loss(projections, config, state.sigreg_step)
-
-
-@functools.partial(jax.jit, static_argnames=("config",))
-def train_steps(
-    state: LeJEPATrainState,
-    images_stack: jnp.ndarray,
-    rng: jax.Array,
-    config: LeJEPAConfig,
-) -> tuple[LeJEPATrainState, jax.Array, LeJEPALoss]:
-    """Runs train_step once per leading entry of images_stack ([n, batch, H,
-    W, 3]) via lax.scan under one jit dispatch, instead of one Python-level
-    call (and one host<->device sync) per step. See TrainingConfig.steps_per_call."""
-
-    def body(carry, images):
-        state, rng = carry
-        rng, step_rng = jax.random.split(rng)
-        state, loss = train_step(state, images, step_rng, config)
-        return (state, rng), loss
-
-    (state, rng), losses = jax.lax.scan(body, (state, rng), images_stack)
-    return state, rng, losses
-
-
-@functools.partial(jax.jit, static_argnames=("config",))
-def eval_steps(
-    state: LeJEPATrainState,
-    images_stack: jnp.ndarray,
-    rng: jax.Array,
-    config: LeJEPAConfig,
-) -> tuple[jax.Array, LeJEPALoss]:
-    """eval_step analogue of train_steps."""
-
-    def body(rng, images):
-        rng, step_rng = jax.random.split(rng)
-        loss = eval_step(state, images, step_rng, config)
-        return rng, loss
-
-    rng, losses = jax.lax.scan(body, rng, images_stack)
-    return rng, losses
-
-
-def _grouped_batches(loader, group_size: int):
-    """Groups consecutive loader batches into stacks of up to group_size,
-    for train_steps/eval_steps. The last group may be smaller — lax.scan
-    just runs fewer iterations, no padding needed."""
-    group = []
-    for batch in loader:
-        group.append(batch)
-        if len(group) == group_size:
-            yield np.stack(group, axis=0)
-            group = []
-    if group:
-        yield np.stack(group, axis=0)
 
 
 class TrainingRun:
@@ -241,45 +185,25 @@ class TrainingRun:
             epoch_start = time.time()
 
             train_losses, train_predictions, train_sigregs = [], [], []
-            if config.steps_per_call <= 1:
-                for batch in train_loader:
-                    rng, step_rng = jax.random.split(rng)
-                    images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
-                    state, loss = train_step(state, images, step_rng, config.model)
-                    train_losses.append(loss.total)
-                    train_predictions.append(loss.prediction)
-                    train_sigregs.append(loss.sigreg)
-            else:
-                for batch_group in _grouped_batches(train_loader, config.steps_per_call):
-                    rng, group_rng = jax.random.split(rng)
-                    images_stack = jnp.asarray(batch_group, dtype=jnp.float32) / 255.0
-                    state, _, losses = train_steps(state, images_stack, group_rng, config.model)
-                    train_losses.append(losses.total)
-                    train_predictions.append(losses.prediction)
-                    train_sigregs.append(losses.sigreg)
+            for batch in train_loader:
+                rng, step_rng = jax.random.split(rng)
+                images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
+                state, loss = train_step(state, images, step_rng, config.model)
+                train_losses.append(loss.total)
+                train_predictions.append(loss.prediction)
+                train_sigregs.append(loss.sigreg)
 
             valid_losses, valid_predictions, valid_sigregs = [], [], []
-            if config.steps_per_call <= 1:
-                for batch in valid_loader:
-                    rng, step_rng = jax.random.split(rng)
-                    images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
-                    loss = eval_step(state, images, step_rng, config.model)
-                    valid_losses.append(loss.total)
-                    valid_predictions.append(loss.prediction)
-                    valid_sigregs.append(loss.sigreg)
-            else:
-                for batch_group in _grouped_batches(valid_loader, config.steps_per_call):
-                    images_stack = jnp.asarray(batch_group, dtype=jnp.float32) / 255.0
-                    rng, losses = eval_steps(state, images_stack, rng, config.model)
-                    valid_losses.append(losses.total)
-                    valid_predictions.append(losses.prediction)
-                    valid_sigregs.append(losses.sigreg)
+            for batch in valid_loader:
+                rng, step_rng = jax.random.split(rng)
+                images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
+                loss = eval_step(state, images, step_rng, config.model)
+                valid_losses.append(loss.total)
+                valid_predictions.append(loss.prediction)
+                valid_sigregs.append(loss.sigreg)
 
             def _mean(values):
-                if not values:
-                    return float("nan")
-                values = [jnp.atleast_1d(v) for v in values]
-                return float(jnp.mean(jnp.concatenate(values)))
+                return float(jnp.mean(jnp.stack(values))) if values else float("nan")
 
             train_mean = _mean(train_losses)
             valid_mean = _mean(valid_losses)
