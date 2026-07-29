@@ -22,7 +22,7 @@ class ViTConfig:
     num_heads: int = 3
     mlp_ratio: float = 4.0
     dropout: float = 0.0
-    compute_dtype: str = "float16"
+    compute_dtype: str = "bfloat16"
 
     def __post_init__(self) -> None:
         if self.image_size % self.patch_size != 0:
@@ -49,7 +49,11 @@ class ViTConfig:
 
 
 class _EncoderBlock(nn.Module):
-    """Pre-norm: LN -> fused MHSA -> residual, LN -> MLP -> residual."""
+    """Pre-norm: LN -> MHSA -> residual, LN -> MLP -> residual.
+
+    Hand-rolled QK^T/softmax/V rather than jax.nn.dot_product_attention:
+    benchmarked slower on T4 (Turing) — its fully-fused cuDNN kernel path
+    targets Ampere+, and T4 falls back to something worse than this."""
 
     embed_dim: int
     num_heads: int
@@ -63,24 +67,41 @@ class _EncoderBlock(nn.Module):
         x = carry
         batch, seq, _ = x.shape
         head_dim = self.embed_dim // self.num_heads
+        scale = head_dim ** -0.5
+
+        def _dropout(value):
+            # self.dropout is a static float, not traced — this branch is
+            # resolved at trace time. At rate 0.0 nn.Dropout is a no-op but
+            # still runs RNG split + bernoulli + mask + scale as real ops on
+            # every call (3x per block here), which is pure launch-overhead
+            # waste on hardware where per-kernel latency dominates.
+            if self.dropout == 0.0:
+                return value
+            return nn.Dropout(self.dropout)(value, deterministic=self.deterministic)
 
         y = nn.LayerNorm(dtype=self.dtype)(x)
         qkv = nn.Dense(3 * self.embed_dim, dtype=self.dtype, name="qkv")(y)
         qkv = qkv.reshape(batch, seq, 3, self.num_heads, head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
 
-        attn = jax.nn.dot_product_attention(q, k, v)
-        attn = attn.reshape(batch, seq, self.embed_dim)
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(self.dtype)
+        attn = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
+        attn = jnp.transpose(attn, (0, 2, 1, 3)).reshape(batch, seq, self.embed_dim)
+
         y = nn.Dense(self.embed_dim, dtype=self.dtype, name="attn_out")(attn)
-        y = nn.Dropout(self.dropout)(y, deterministic=self.deterministic)
+        y = _dropout(y)
         x = x + y
 
         y = nn.LayerNorm(dtype=self.dtype)(x)
         y = nn.Dense(self.mlp_dim, dtype=self.dtype)(y)
         y = nn.gelu(y)
-        y = nn.Dropout(self.dropout)(y, deterministic=self.deterministic)
+        y = _dropout(y)
         y = nn.Dense(self.embed_dim, dtype=self.dtype)(y)
-        y = nn.Dropout(self.dropout)(y, deterministic=self.deterministic)
+        y = _dropout(y)
         return x + y, None
 
 
