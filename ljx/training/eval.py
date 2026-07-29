@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import optax
 from flax.core import freeze, unfreeze
 from flax.traverse_util import path_aware_map
+from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import train_state
 
 from ljx.data.dali_pipeline import build_labeled_iterator
@@ -77,7 +78,13 @@ def eval_step(state: ProbeState, images: jnp.ndarray, targets: jnp.ndarray):
 
 
 def load_backbone_params(checkpoint_path: pathlib.Path, model_config: LeJEPAConfig, template_params) -> dict:
-    lejepa_template = {"params": template_params, "batch_stats": {}, "opt_state": (), "sigreg_step": jnp.array(0)}
+    lejepa_template = {
+        "params": template_params,
+        "batch_stats": {},
+        "opt_state": (),
+        "sigreg_step": jnp.array(0),
+        "dynamic_scale": dynamic_scale_lib.DynamicScale(),
+    }
     restored = checkpoint.load(checkpoint_path, lejepa_template)
     return restored["params"]["backbone"]
 

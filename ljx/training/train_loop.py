@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 import jax
 import jax.numpy as jnp
 import optax
+from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import train_state
 
 from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
@@ -49,6 +50,7 @@ class TrainingConfig:
 class LeJEPATrainState(train_state.TrainState):
     batch_stats: dict
     sigreg_step: jnp.ndarray
+    dynamic_scale: dynamic_scale_lib.DynamicScale
 
 
 def _views_from_batch(batch: dict) -> tuple[list[jnp.ndarray], list[jnp.ndarray]]:
@@ -79,9 +81,22 @@ def train_step(
         loss = lejepa_loss(projections, config, state.sigreg_step)
         return loss.total, (loss, mutated["batch_stats"])
 
-    grads, (loss, batch_stats) = jax.grad(loss_fn, has_aux=True)(state.params)
-    state = state.apply_gradients(grads=grads)
-    state = state.replace(batch_stats=batch_stats, sigreg_step=state.sigreg_step + 1)
+    dynamic_scale, finite, (loss, batch_stats), grads = state.dynamic_scale.value_and_grad(
+        loss_fn, has_aux=True
+    )(state.params)
+
+    new_state = state.apply_gradients(grads=grads)
+    select = lambda new, old: jnp.where(finite, new, old)
+    params = jax.tree_util.tree_map(select, new_state.params, state.params)
+    opt_state = jax.tree_util.tree_map(select, new_state.opt_state, state.opt_state)
+
+    state = new_state.replace(
+        params=params,
+        opt_state=opt_state,
+        batch_stats=batch_stats,
+        sigreg_step=state.sigreg_step + 1,
+        dynamic_scale=dynamic_scale,
+    )
     return state, loss
 
 
@@ -158,6 +173,7 @@ class TrainingRun:
             tx=optimizer,
             batch_stats=variables.get("batch_stats", {}),
             sigreg_step=jnp.array(0, dtype=jnp.uint32),
+            dynamic_scale=dynamic_scale_lib.DynamicScale(),
         )
 
         metrics.dump_config(self.artifact_directory, config)
@@ -172,6 +188,7 @@ class TrainingRun:
                 "batch_stats": state.batch_stats,
                 "opt_state": state.opt_state,
                 "sigreg_step": state.sigreg_step,
+                "dynamic_scale": state.dynamic_scale,
             }
             restored = checkpoint.load(path, template)
             state = state.replace(**restored)
@@ -230,5 +247,6 @@ class TrainingRun:
                         "batch_stats": state.batch_stats,
                         "opt_state": state.opt_state,
                         "sigreg_step": state.sigreg_step,
+                        "dynamic_scale": state.dynamic_scale,
                     },
                 )

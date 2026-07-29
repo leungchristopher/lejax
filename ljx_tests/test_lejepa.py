@@ -10,8 +10,9 @@ from ljx.models.lejepa import LeJEPAConfig, invariance_loss, lejepa_loss
 
 
 def tiny_config():
+    # float32: CPU dot_general doesn't support fp16 (the production default)
     return LeJEPAConfig(
-        backbone=ViTConfig(depth=2, embed_dim=24, num_heads=2),
+        backbone=ViTConfig(depth=2, embed_dim=24, num_heads=2, compute_dtype="float32"),
         projector_hidden_dims=(32, 32),
         projector_output_dim=16,
         sigreg=SigRegConfig(num_projections=32, seed=7),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -21,7 +22,7 @@ class ViTConfig:
     num_heads: int = 3
     mlp_ratio: float = 4.0
     dropout: float = 0.0
-    compute_dtype: str = "bfloat16"
+    compute_dtype: str = "float16"
 
     def __post_init__(self) -> None:
         if self.image_size % self.patch_size != 0:
@@ -48,31 +49,39 @@ class ViTConfig:
 
 
 class _EncoderBlock(nn.Module):
-    """Pre-norm: LN -> MHSA -> residual, LN -> MLP -> residual."""
+    """Pre-norm: LN -> fused MHSA -> residual, LN -> MLP -> residual."""
 
     embed_dim: int
     num_heads: int
     mlp_dim: int
     dropout: float
+    deterministic: bool
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+    def __call__(self, carry: jnp.ndarray, _):
+        x = carry
+        batch, seq, _ = x.shape
+        head_dim = self.embed_dim // self.num_heads
+
         y = nn.LayerNorm(dtype=self.dtype)(x)
-        y = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            dropout_rate=self.dropout,
-            dtype=self.dtype,
-        )(y, y, deterministic=deterministic)
+        qkv = nn.Dense(3 * self.embed_dim, dtype=self.dtype, name="qkv")(y)
+        qkv = qkv.reshape(batch, seq, 3, self.num_heads, head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+        attn = jax.nn.dot_product_attention(q, k, v)
+        attn = attn.reshape(batch, seq, self.embed_dim)
+        y = nn.Dense(self.embed_dim, dtype=self.dtype, name="attn_out")(attn)
+        y = nn.Dropout(self.dropout)(y, deterministic=self.deterministic)
         x = x + y
 
         y = nn.LayerNorm(dtype=self.dtype)(x)
         y = nn.Dense(self.mlp_dim, dtype=self.dtype)(y)
         y = nn.gelu(y)
-        y = nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        y = nn.Dropout(self.dropout)(y, deterministic=self.deterministic)
         y = nn.Dense(self.embed_dim, dtype=self.dtype)(y)
-        y = nn.Dropout(self.dropout)(y, deterministic=deterministic)
-        return x + y
+        y = nn.Dropout(self.dropout)(y, deterministic=self.deterministic)
+        return x + y, None
 
 
 def resample_matrix(source: int, target: int) -> jnp.ndarray:
@@ -129,14 +138,20 @@ class ViT(nn.Module):
         tokens = tokens + pos
 
         mlp_dim = int(cfg.embed_dim * cfg.mlp_ratio)
-        for _ in range(cfg.depth):
-            tokens = _EncoderBlock(
-                embed_dim=cfg.embed_dim,
-                num_heads=cfg.num_heads,
-                mlp_dim=mlp_dim,
-                dropout=cfg.dropout,
-                dtype=compute_dtype,
-            )(tokens, deterministic)
+        scanned_encoder = nn.scan(
+            _EncoderBlock,
+            variable_axes={"params": 0},
+            split_rngs={"params": True, "dropout": True},
+            length=cfg.depth,
+        )
+        tokens, _ = scanned_encoder(
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.num_heads,
+            mlp_dim=mlp_dim,
+            dropout=cfg.dropout,
+            deterministic=deterministic,
+            dtype=compute_dtype,
+        )(tokens, None)
 
         tokens = nn.LayerNorm(dtype=compute_dtype)(tokens)
         return tokens[:, 0, :].astype(jnp.float32)
