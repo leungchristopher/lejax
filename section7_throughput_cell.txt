@@ -1,0 +1,64 @@
+import time
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
+from ljx.data.tiny_imagenet import split_pretrain_file_lists
+from ljx.training.train_loop import LeJEPATrainState, TrainingConfig, _views_from_batch, train_step
+
+config = TrainingConfig()  # real batch size/model, just measuring throughput
+dataset_path = "/content/datasets/tiny-imagenet-200/train"
+
+train_list, _ = split_pretrain_file_lists(dataset_path, config.num_valid_images, "/content/speed")
+num_train_images = len(train_list.read_text().strip().splitlines())
+
+train_iter = build_multicrop_iterator(
+    file_root=dataset_path,
+    file_list=str(train_list),
+    batch_size=config.batch_size,
+    num_threads=config.num_workers,
+    seed=config.seed,
+    shuffle=True,
+)
+
+rng = jax.random.PRNGKey(config.seed)
+crop_config = MultiCropConfig()
+dummy_global = jnp.zeros((1, crop_config.global_size, crop_config.global_size, 3))
+dummy_local = jnp.zeros((1, crop_config.local_size, crop_config.local_size, 3))
+
+model = config.model.init()
+variables = model.init(rng, [dummy_global], [dummy_local], deterministic=True, use_running_average=True)
+state = LeJEPATrainState.create(
+    apply_fn=model.apply,
+    params=variables["params"],
+    tx=optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
+    batch_stats=variables.get("batch_stats", {}),
+    sigreg_step=jnp.array(0, dtype=jnp.uint32),
+)
+
+it = iter(train_iter)
+
+# Warmup: this call triggers XLA compilation, excluded from the timed loop below.
+batch = next(it)
+global_views, local_views = _views_from_batch(batch)
+compile_start = time.time()
+state, loss = train_step(state, global_views, local_views, config.model)
+jax.block_until_ready(loss.total)
+print(f"compile + first step: {time.time() - compile_start:.1f}s (one-time cost, not steady-state)")
+
+# Steady-state timing: compilation already paid for above.
+num_steps = 50
+start = time.time()
+for _ in range(num_steps):
+    batch = next(it)
+    global_views, local_views = _views_from_batch(batch)
+    state, loss = train_step(state, global_views, local_views, config.model)
+jax.block_until_ready(loss.total)
+seconds = time.time() - start
+
+per_step = seconds / num_steps
+images_per_sec = config.batch_size / per_step
+print(f"{per_step * 1000:.1f} ms/step steady-state, {images_per_sec:.0f} images/s")
+print(f"=> {(num_train_images / config.batch_size) * per_step / 60:.1f} min/epoch ({num_train_images} images)")

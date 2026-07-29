@@ -12,6 +12,7 @@ import pathlib
 
 
 def class_names(train_root: pathlib.Path) -> list[str]:
+    train_root = pathlib.Path(train_root)
     names = sorted(p.name for p in train_root.iterdir() if p.is_dir())
     if not names:
         raise ValueError(f"found no class directories under {train_root}")
@@ -20,7 +21,7 @@ def class_names(train_root: pathlib.Path) -> list[str]:
 
 def build_val_file_list(dataset_root: pathlib.Path, class_to_index: dict[str, int]) -> pathlib.Path:
     """val_annotations.txt line: <filename>\\t<wnid>\\t<x0>\\t<y0>\\t<x1>\\t<y1>."""
-    val_root = dataset_root / "val"
+    val_root = pathlib.Path(dataset_root) / "val"
     annotations = (val_root / "val_annotations.txt").read_text().strip().splitlines()
 
     lines = []
@@ -34,7 +35,7 @@ def build_val_file_list(dataset_root: pathlib.Path, class_to_index: dict[str, in
 
 
 def num_classes(dataset_root: pathlib.Path) -> int:
-    return len(class_names(dataset_root / "train"))
+    return len(class_names(pathlib.Path(dataset_root) / "train"))
 
 
 IMAGE_EXTENSIONS = {"jpeg", "jpg", "png", "bmp", "tif", "tiff"}
@@ -55,6 +56,9 @@ def split_pretrain_file_lists(
     """Sorted recursive scan, tail split off as validation. Writes two
     file_list manifests (relative paths, dummy label — DALI's reader
     requires some label column) under artifact_directory."""
+    dataset_path = pathlib.Path(dataset_path)
+    artifact_directory = pathlib.Path(artifact_directory)
+
     paths = _scan_images(dataset_path)
     num_valid_images = min(num_valid_images, max(len(paths) - 1, 0))
     boundary = len(paths) - num_valid_images
