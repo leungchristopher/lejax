@@ -8,6 +8,7 @@ import time
 import jax
 import jax.numpy as jnp
 import optax
+from flax.training import dynamic_scale as dynamic_scale_lib
 
 from ljx.data.dali_pipeline import MultiCropConfig, build_multicrop_iterator
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
@@ -50,6 +51,7 @@ def run_one(
         tx=optimizer,
         batch_stats=variables.get("batch_stats", {}),
         sigreg_step=jnp.array(0, dtype=jnp.uint32),
+        dynamic_scale=dynamic_scale_lib.DynamicScale(),
     )
 
     losses, predictions, sigregs = [], [], []
