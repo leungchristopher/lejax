@@ -1,0 +1,27 @@
+/target/
+/archive/
+/notebooks/
+/datasets/
+target/
+archive/
+notebooks/
+datasets/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+build/
+dist/
+
+# training output
+artifacts/
+*.msgpack
