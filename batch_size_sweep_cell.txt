@@ -1,0 +1,90 @@
+# Native (DALI-free) path, timing across a few batch sizes. Tests whether
+# per-step cost is mostly fixed launch overhead (bigger batch -> more images/s)
+# or scales with batch (bigger batch -> same images/s).
+
+import time
+from dataclasses import replace
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from ljx.data.jax_augment import generate_views
+from ljx.data.raw_loader import RawImageLoader
+from ljx.data.tiny_imagenet import split_pretrain_file_lists
+from ljx.training.train_loop import LeJEPATrainState, TrainingConfig
+from ljx.training.train_loop_native import (
+    GLOBAL_VIEW,
+    LOCAL_VIEW,
+    NUM_GLOBAL_VIEWS,
+    NUM_LOCAL_VIEWS,
+    native_train_step,
+)
+
+dataset_path = "/content/datasets/tiny-imagenet-200/train"
+batch_sizes = [64, 128, 256]
+num_steps = 30
+
+results = []
+for batch_size in batch_sizes:
+    config = replace(TrainingConfig(), batch_size=batch_size)
+
+    train_list, _ = split_pretrain_file_lists(
+        dataset_path, config.num_valid_images, f"/content/bs_sweep_{batch_size}"
+    )
+    num_train_images = len(train_list.read_text().strip().splitlines())
+
+    loader = RawImageLoader(
+        train_list, dataset_path, config.batch_size,
+        shuffle=True, seed=config.seed, num_workers=config.num_workers,
+    )
+
+    rng = jax.random.PRNGKey(config.seed)
+    rng, init_rng = jax.random.split(rng)
+    dummy_images = jnp.zeros((1, 64, 64, 3))
+    dummy_global = list(generate_views(init_rng, dummy_images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
+    dummy_local = list(generate_views(init_rng, dummy_images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
+
+    model = config.model.init()
+    variables = model.init(init_rng, dummy_global, dummy_local, deterministic=True, use_running_average=True)
+    state = LeJEPATrainState.create(
+        apply_fn=model.apply,
+        params=variables["params"],
+        tx=optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
+        batch_stats=variables.get("batch_stats", {}),
+        sigreg_step=jnp.array(0, dtype=jnp.uint32),
+    )
+
+    it = iter(loader)
+
+    batch = next(it)
+    images = jnp.asarray(batch)
+    rng, step_rng = jax.random.split(rng)
+    compile_start = time.time()
+    state, loss = native_train_step(state, images, step_rng, config.model)
+    jax.block_until_ready(loss.total)
+    compile_time = time.time() - compile_start
+
+    start = time.time()
+    for _ in range(num_steps):
+        batch = next(it)
+        images = jnp.asarray(batch)
+        rng, step_rng = jax.random.split(rng)
+        state, loss = native_train_step(state, images, step_rng, config.model)
+    jax.block_until_ready(loss.total)
+    seconds = time.time() - start
+
+    per_step = seconds / num_steps
+    images_per_sec = batch_size / per_step
+    epoch_minutes = (num_train_images / batch_size) * per_step / 60
+
+    results.append((batch_size, compile_time, per_step * 1000, images_per_sec, epoch_minutes))
+    print(
+        f"batch_size={batch_size:4d}  compile={compile_time:5.1f}s  "
+        f"{per_step * 1000:7.1f} ms/step  {images_per_sec:6.0f} img/s  "
+        f"{epoch_minutes:5.1f} min/epoch"
+    )
+
+print()
+print("if images/s climbs with batch_size, per-step cost is mostly fixed overhead (as expected)")
+print("if images/s stays flat, per-step cost scales with batch (compute-bound, not launch-bound)")
