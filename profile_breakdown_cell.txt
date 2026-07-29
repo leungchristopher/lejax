@@ -1,0 +1,69 @@
+# Run this in the same cell/session as section 7 (reuses state, config, model, train_iter, it).
+# Bisects the 788ms/step: forward-only vs full train_step, and backbone-alone vs
+# backbone+projector+SIGReg, to find which stage the time is actually going.
+
+import functools
+import time
+
+import jax
+import jax.numpy as jnp
+
+from ljx.models.backbone import ViT
+from ljx.models.lejepa import lejepa_loss
+from ljx.training.train_loop import _views_from_batch
+
+# model.backbone only exists inside a bound (apply/init) context in Flax, so
+# a standalone ViT instance is needed to call it directly here.
+backbone_module = ViT(config=config.model.backbone)
+
+
+def timed(fn, *args, n=20):
+    fn(*args)  # warmup / compile, excluded
+    jax.block_until_ready(fn(*args))
+    start = time.time()
+    for _ in range(n):
+        out = fn(*args)
+    jax.block_until_ready(out)
+    return (time.time() - start) / n
+
+
+# --- 1. backbone alone (no projector, no SIGReg) ---
+@functools.partial(jax.jit, static_argnames=("deterministic",))
+def backbone_only(params, global_views, local_views, deterministic=True):
+    # Globals (64px) and locals (32px) differ in spatial size, so — same as
+    # the real forward path — batch within each resolution group, not across.
+    globals_stacked = jnp.concatenate(global_views, axis=0)
+    locals_stacked = jnp.concatenate(local_views, axis=0)
+    variables = {"params": params["backbone"]}
+    out_global = backbone_module.apply(variables, globals_stacked, deterministic=deterministic)
+    out_local = backbone_module.apply(variables, locals_stacked, deterministic=deterministic)
+    return out_global, out_local
+
+
+# --- 2. full forward (backbone + projector + SIGReg loss), no gradient ---
+@functools.partial(jax.jit, static_argnames=("config",))
+def forward_only(params, batch_stats, global_views, local_views, config):
+    variables = {"params": params, "batch_stats": batch_stats}
+    projections, _ = state.apply_fn(
+        variables, global_views, local_views,
+        deterministic=False, use_running_average=False, mutable=["batch_stats"],
+    )
+    return lejepa_loss(projections, config, state.sigreg_step).total
+
+
+# --- 3. full train_step (forward + backward + optimizer), already defined in train_loop ---
+from ljx.training.train_loop import train_step
+
+batch = next(it)
+global_views, local_views = _views_from_batch(batch)
+
+t_backbone = timed(lambda gv=global_views, lv=local_views: backbone_only(state.params, gv, lv))
+t_forward = timed(lambda gv=global_views, lv=local_views: forward_only(state.params, state.batch_stats, gv, lv, config.model))
+t_full = timed(lambda gv=global_views, lv=local_views: train_step(state, gv, lv, config.model)[1].total)
+
+print(f"backbone only (no projector/sigreg):  {t_backbone * 1000:.1f} ms")
+print(f"full forward (backbone+proj+sigreg):  {t_forward * 1000:.1f} ms")
+print(f"full train_step (+ backward+optim):   {t_full * 1000:.1f} ms")
+print()
+print(f"=> projector+SIGReg cost:  {(t_forward - t_backbone) * 1000:.1f} ms")
+print(f"=> backward+optimizer cost: {(t_full - t_forward) * 1000:.1f} ms")

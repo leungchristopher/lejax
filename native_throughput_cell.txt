@@ -1,0 +1,69 @@
+# Compare against section 7's DALI-path number. Run on the jax-native-augment
+# branch (not main) — this needs ljx/training/train_loop_native.py.
+
+import time
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from ljx.data.raw_loader import RawImageLoader
+from ljx.data.tiny_imagenet import split_pretrain_file_lists
+from ljx.training.train_loop import LeJEPATrainState, TrainingConfig
+from ljx.training.train_loop_native import GLOBAL_VIEW, LOCAL_VIEW, NUM_GLOBAL_VIEWS, NUM_LOCAL_VIEWS, native_train_step
+from ljx.data.jax_augment import generate_views
+
+config = TrainingConfig()
+dataset_path = "/content/datasets/tiny-imagenet-200/train"
+
+train_list, _ = split_pretrain_file_lists(dataset_path, config.num_valid_images, "/content/speed_native")
+num_train_images = len(train_list.read_text().strip().splitlines())
+
+loader = RawImageLoader(
+    train_list, dataset_path, config.batch_size,
+    shuffle=True, seed=config.seed, num_workers=config.num_workers,
+)
+
+rng = jax.random.PRNGKey(config.seed)
+rng, init_rng = jax.random.split(rng)
+dummy_images = jnp.zeros((1, 64, 64, 3))
+dummy_global = list(generate_views(init_rng, dummy_images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
+dummy_local = list(generate_views(init_rng, dummy_images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
+
+model = config.model.init()
+variables = model.init(init_rng, dummy_global, dummy_local, deterministic=True, use_running_average=True)
+state = LeJEPATrainState.create(
+    apply_fn=model.apply,
+    params=variables["params"],
+    tx=optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
+    batch_stats=variables.get("batch_stats", {}),
+    sigreg_step=jnp.array(0, dtype=jnp.uint32),
+)
+
+it = iter(loader)
+
+# Warmup pays XLA compile cost once, excluded from the timed loop below.
+batch = next(it)
+images = jnp.asarray(batch)
+rng, step_rng = jax.random.split(rng)
+compile_start = time.time()
+state, loss = native_train_step(state, images, step_rng, config.model)
+jax.block_until_ready(loss.total)
+print(f"compile + first step: {time.time() - compile_start:.1f}s (one-time)")
+
+num_steps = 50
+start = time.time()
+for _ in range(num_steps):
+    batch = next(it)
+    images = jnp.asarray(batch)
+    rng, step_rng = jax.random.split(rng)
+    state, loss = native_train_step(state, images, step_rng, config.model)
+jax.block_until_ready(loss.total)
+seconds = time.time() - start
+
+per_step = seconds / num_steps
+images_per_sec = config.batch_size / per_step
+print(f"{per_step * 1000:.1f} ms/step steady-state, {images_per_sec:.0f} images/s")
+print(f"=> {(num_train_images / config.batch_size) * per_step / 60:.1f} min/epoch ({num_train_images} images)")
+print()
+print("compare against DALI path's 788.2 ms/step")
