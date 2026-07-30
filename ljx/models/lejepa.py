@@ -13,6 +13,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from flax import linen as nn
 
+from ljx.data.jax_augment import ViewConfig
 from ljx.losses.sigreg import SigRegConfig, sigreg_loss_multi_view
 from ljx.models.backbone import ViT, ViTConfig
 from ljx.models.projector import Projector, ProjectorConfig
@@ -30,6 +31,14 @@ class LeJEPAConfig:
     sigreg: SigRegConfig = field(
         default_factory=lambda: SigRegConfig(num_projections=DEFAULT_NUM_PROJECTIONS)
     )
+    global_view: ViewConfig = field(default_factory=lambda: ViewConfig(size=64, scale=(0.30, 1.0)))
+    local_view: ViewConfig = field(default_factory=lambda: ViewConfig(size=32, scale=(0.05, 0.30)))
+    num_global_views: int = 2
+    # 6 is the DINO/iBOT-style convention the reference repo inherited, tuned
+    # for larger-scale pretraining. 4 trades some of that multi-crop signal
+    # for ~15% fewer tokens through the MLP/QKV projections per step at this
+    # ViT-Tiny/64px scale, where the original ratio is unverified.
+    num_local_views: int = 4
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.lejepa_lambda <= 1.0):

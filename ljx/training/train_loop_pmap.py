@@ -15,7 +15,6 @@ from __future__ import annotations
 import functools
 import pathlib
 import time
-from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -26,16 +25,9 @@ from flax import jax_utils
 from ljx.data.jax_augment import generate_views
 from ljx.data.raw_loader import CachedImageLoader
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
-from ljx.models.lejepa import LeJEPALoss, lejepa_loss
+from ljx.models.lejepa import lejepa_loss
 from ljx.training import checkpoint, metrics
-from ljx.training.train_loop import (
-    GLOBAL_VIEW,
-    LOCAL_VIEW,
-    NUM_GLOBAL_VIEWS,
-    NUM_LOCAL_VIEWS,
-    LeJEPATrainState,
-    TrainingConfig,
-)
+from ljx.training.train_loop import LeJEPATrainState, TrainingConfig
 
 
 @functools.partial(jax.pmap, axis_name="devices", static_broadcasted_argnums=(3, 4))
@@ -43,8 +35,8 @@ def pmap_train_step(state, images, rng, config, loss_scale=1.0):
     def loss_fn(params):
         variables = {"params": params, "batch_stats": state.batch_stats}
         rng_global, rng_local = jax.random.split(rng)
-        global_views = list(generate_views(rng_global, images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
-        local_views = list(generate_views(rng_local, images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
+        global_views = list(generate_views(rng_global, images, config.global_view, config.num_global_views))
+        local_views = list(generate_views(rng_local, images, config.local_view, config.num_local_views))
         projections, mutated = state.apply_fn(
             variables,
             global_views,
@@ -75,8 +67,8 @@ def pmap_train_step(state, images, rng, config, loss_scale=1.0):
 def pmap_eval_step(state, images, rng, config):
     variables = {"params": state.params, "batch_stats": state.batch_stats}
     rng_global, rng_local = jax.random.split(rng)
-    global_views = list(generate_views(rng_global, images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
-    local_views = list(generate_views(rng_local, images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
+    global_views = list(generate_views(rng_global, images, config.global_view, config.num_global_views))
+    local_views = list(generate_views(rng_local, images, config.local_view, config.num_local_views))
     projections = state.apply_fn(
         variables, global_views, local_views, deterministic=True, use_running_average=True
     )
@@ -123,7 +115,6 @@ class PmapTrainingRun:
             shuffle=False, seed=config.seed, num_workers=config.num_workers,
         )
 
-        num_train_images = sum(1 for _ in train_list.read_text().strip().splitlines())
         steps_per_epoch = max(len(train_loader) // num_devices, 1)
         total_steps = max(steps_per_epoch * config.num_epochs, 1)
 
@@ -136,9 +127,10 @@ class PmapTrainingRun:
 
         rng = jax.random.PRNGKey(config.seed)
         rng, init_rng = jax.random.split(rng)
-        dummy_images = jnp.zeros((1, 64, 64, 3))
-        dummy_global = list(generate_views(init_rng, dummy_images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
-        dummy_local = list(generate_views(init_rng, dummy_images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
+        image_size = config.model.backbone.image_size
+        dummy_images = jnp.zeros((1, image_size, image_size, 3))
+        dummy_global = list(generate_views(init_rng, dummy_images, config.model.global_view, config.model.num_global_views))
+        dummy_local = list(generate_views(init_rng, dummy_images, config.model.local_view, config.model.num_local_views))
 
         model = config.model.init()
         variables = model.init(

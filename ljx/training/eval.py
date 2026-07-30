@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import functools
 import pathlib
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
@@ -100,6 +99,8 @@ class EvalRun:
         dataset_root: pathlib.Path,
         checkpoint_path: pathlib.Path,
         artifact_directory: pathlib.Path,
+        wandb_project: str | None = None,
+        wandb_run_name: str | None = None,
     ):
         self.config = config
         self.dataset_root = pathlib.Path(dataset_root)
@@ -107,6 +108,8 @@ class EvalRun:
         self.artifact_directory = pathlib.Path(artifact_directory)
         self.artifact_directory.mkdir(parents=True, exist_ok=True)
         self.classes = class_names(self.dataset_root / "train")
+        self.wandb_project = wandb_project
+        self.wandb_run_name = wandb_run_name
 
     def num_classes(self) -> int:
         return len(self.classes)
@@ -148,6 +151,11 @@ class EvalRun:
 
         metrics.dump_config(self.artifact_directory, config)
         logger = metrics.MetricsLogger(self.artifact_directory)
+        wandb_logger = (
+            metrics.WandbLogger(self.wandb_project, config, self.wandb_run_name)
+            if self.wandb_project is not None
+            else None
+        )
 
         def _mean(values):
             return float(jnp.mean(jnp.stack(values))) if values else float("nan")
@@ -174,10 +182,16 @@ class EvalRun:
                 f"valid_acc={_mean(valid_acc):.4f}"
             )
 
-            logger.log(
+            epoch_fields = dict(
                 epoch=epoch,
                 epoch_seconds=time.time() - epoch_start,
                 train_loss=_mean(train_losses),
                 train_acc=_mean(train_acc),
                 valid_acc=_mean(valid_acc),
             )
+            logger.log(**epoch_fields)
+            if wandb_logger is not None:
+                wandb_logger.log(**epoch_fields)
+
+        if wandb_logger is not None:
+            wandb_logger.finish()

@@ -11,16 +11,7 @@ Dataset must already be materialized (see scripts/materialize_hf_tiny_imagenet.p
 from __future__ import annotations
 
 import argparse
-import os
 import pathlib
-
-# Must be set before jax is imported anywhere (including transitively, via
-# ljx.training below). JAX preallocates ~90% of GPU memory by default, which
-# leaves little headroom for anything else sharing the process — but
-# disabling preallocation entirely forces an on-demand cudaMalloc/cudaFree
-# every step, which is much slower. Cap the preallocated pool instead.
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", ".8")
 
 from ljx.training.eval import EvalConfig, EvalRun
 from ljx.training.train_loop import TrainingConfig, TrainingRun

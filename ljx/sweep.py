@@ -12,15 +12,7 @@ import optax
 from ljx.data.jax_augment import generate_views
 from ljx.data.raw_loader import CachedImageLoader
 from ljx.data.tiny_imagenet import split_pretrain_file_lists
-from ljx.training.train_loop import (
-    GLOBAL_VIEW,
-    LOCAL_VIEW,
-    NUM_GLOBAL_VIEWS,
-    NUM_LOCAL_VIEWS,
-    LeJEPATrainState,
-    TrainingConfig,
-    train_step,
-)
+from ljx.training.train_loop import LeJEPATrainState, TrainingConfig, train_step
 
 
 def run_one(
@@ -41,9 +33,10 @@ def run_one(
 
     rng = jax.random.PRNGKey(config.seed)
     rng, init_rng = jax.random.split(rng)
-    dummy_images = jnp.zeros((1, 64, 64, 3))
-    dummy_global = list(generate_views(init_rng, dummy_images, GLOBAL_VIEW, NUM_GLOBAL_VIEWS))
-    dummy_local = list(generate_views(init_rng, dummy_images, LOCAL_VIEW, NUM_LOCAL_VIEWS))
+    image_size = config.model.backbone.image_size
+    dummy_images = jnp.zeros((1, image_size, image_size, 3))
+    dummy_global = list(generate_views(init_rng, dummy_images, config.model.global_view, config.model.num_global_views))
+    dummy_local = list(generate_views(init_rng, dummy_images, config.model.local_view, config.model.num_local_views))
 
     model = config.model.init()
     variables = model.init(
@@ -66,7 +59,7 @@ def run_one(
             break
         rng, step_rng = jax.random.split(rng)
         images = jnp.asarray(batch, dtype=jnp.float32) / 255.0
-        state, loss = train_step(state, images, step_rng, config.model)
+        state, loss = train_step(state, images, step_rng, config.model, config.loss_scale)
         losses.append(loss.total)
         predictions.append(loss.prediction)
         sigregs.append(loss.sigreg)

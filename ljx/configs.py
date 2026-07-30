@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 
 from ljx.losses.sigreg import SigRegConfig
 from ljx.models.backbone import ViTConfig

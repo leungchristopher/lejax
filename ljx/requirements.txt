@@ -4,3 +4,4 @@ optax
 pillow
 numpy
 pytest
+wandb
